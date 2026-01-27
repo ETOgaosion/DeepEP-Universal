@@ -42,18 +42,19 @@ We test low-latency kernels on H800 with each connected to a CX7 InfiniBand 400 
 
 ### Requirements
 
-- Ampere (SM80), Hopper (SM90) GPUs, or other architectures with SM90 PTX ISA support
+- Ampere (SM80), Hopper (SM90) GPUs, Blackwell(SM120) GPUs
 - Python 3.8 and above
 - CUDA version
   - CUDA 11.0 and above for SM80 GPUs
   - CUDA 12.3 and above for SM90 GPUs
+  - CUDA 12.8 and above for SM120 GPUs
 - PyTorch 2.1 and above
-- NVLink for intranode communication
+- P2P Support for intranode communication
 - RDMA network for internode communication
 
 ### Download and install NVSHMEM dependency
 
-DeepEP also depends on NVSHMEM. Please refer to our [NVSHMEM Installation Guide](third-party/README.md) for instructions.
+See [third-party/nvshmem]()
 
 ### Development
 

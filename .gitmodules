@@ -1,0 +1,3 @@
+[submodule "third-party/nvshmem"]
+	path = third-party/nvshmem
+	url = https://github.com/NVIDIA/nvshmem.git
