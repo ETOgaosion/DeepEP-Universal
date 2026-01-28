@@ -108,24 +108,28 @@ class Buffer:
             # Enable IBGDA
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+            if use_nvshmem_intranode and not low_latency_mode and self.runtime.get_num_rdma_ranks() == 1:
+                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '0'
+                os.environ.pop('NVSHMEM_IBGDA_NUM_RC_PER_PE', None)
+            else:
+                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+                os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
 
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
             self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
             os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
 
-                # Reduce gpu memory usage
-                # 6 default teams + 1 extra team
-                os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-                # Disable NVLink SHArP
-                os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
-                # NOTES: NVSHMEM initialization requires at least 256 MiB
-                os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+            # Reduce gpu memory usage
+            # 6 default teams + 1 extra team
+            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+            # Disable NVLink SHArP
+            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
+            # NOTES: NVSHMEM initialization requires at least 256 MiB
+            os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
 
-                if not allow_mnnvl:
-                    # Disable multi-node NVLink detection
-                    os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
+            if not allow_mnnvl:
+                # Disable multi-node NVLink detection
+                os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
             # Synchronize using the root ID
             if (use_nvshmem_intranode and self.rank == 0) or (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
@@ -453,6 +457,43 @@ class Buffer:
                                                                           getattr(previous_event, 'event',
                                                                                   None), async_finish, allocate_on_comm_stream)
         return recv_x, recv_topk_weights, EventOverlap(event)
+
+    def _assert_nvshmem_intranode(self) -> None:
+        if not (self.num_nvl_bytes > 0 and self.num_rdma_bytes == 0):
+            raise ValueError("NVSHMEM intranode requires num_nvl_bytes > 0 and num_rdma_bytes == 0")
+
+    # noinspection PyTypeChecker
+    def dispatch_nvshmem(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                         handle: Optional[Tuple] = None,
+                         num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
+                         is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
+                         topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
+                         num_worst_tokens: int = 0, config: Optional[Config] = None,
+                         previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                         allocate_on_comm_stream: bool = False) -> \
+            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
+            Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
+        """
+        NVSHMEM-only intranode dispatch. Uses the same signature as dispatch, but requires NVSHMEM intranode config.
+        """
+        self._assert_nvshmem_intranode()
+        return self.dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
+                             topk_idx, topk_weights, expert_alignment, num_worst_tokens, config, previous_event,
+                             async_finish, allocate_on_comm_stream)
+
+    # noinspection PyTypeChecker
+    def combine_nvshmem(self, x: torch.Tensor, handle: Tuple,
+                        topk_weights: Optional[torch.Tensor] = None,
+                        bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
+                        config: Optional[Config] = None,
+                        previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                        allocate_on_comm_stream: bool = False) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        """
+        NVSHMEM-only intranode combine. Uses the same signature as combine, but requires NVSHMEM intranode config.
+        """
+        self._assert_nvshmem_intranode()
+        return self.combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
 
     # noinspection PyTypeChecker
     def internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],

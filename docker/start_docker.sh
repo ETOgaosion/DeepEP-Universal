@@ -1,1 +1,1 @@
-docker create --rm -it --gpus all --shm-size=25GB --name deepep_universal_$(whoami) -v $(pwd):/workspace/DeepEP -v /data:/data --network=host --cap-add SYS_ADMIN whatcanyousee/deepep-universal:v0.1-pytorch25.02
+docker create -it --gpus all --shm-size=25GB --name deepep_universal_$(whoami) -v $(pwd):/workspace/DeepEP -v /data:/data --network=host --cap-add SYS_ADMIN whatcanyousee/deepep-universal:v0.1-pytorch25.02

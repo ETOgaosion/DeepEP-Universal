@@ -633,7 +633,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
         // Copy rank prefix matrix and clean flags
         intranode::cached_notify_dispatch(
-            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
+            rank_prefix_matrix.data_ptr<int>(), num_memset_int, intranode_buffer_ptrs_gpu,
+            intranode_barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
     } else {
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -659,8 +660,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                    rank_prefix_matrix.data_ptr<int>(),
                                    num_memset_int,
                                    expert_alignment,
-                                   buffer_ptrs_gpu,
-                                   barrier_signal_ptrs_gpu,
+                                   intranode_buffer_ptrs_gpu,
+                                   intranode_barrier_signal_ptrs_gpu,
                                    rank,
                                    comm_stream,
                                    num_channels);
@@ -756,7 +757,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         num_scales,
                         scale_token_stride,
                         scale_hidden_stride,
-                        buffer_ptrs_gpu,
+                        intranode_buffer_ptrs_gpu,
                         rank,
                         num_ranks,
                         comm_stream,
@@ -886,12 +887,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    intranode::cached_notify_combine(buffer_ptrs_gpu,
+    intranode::cached_notify_combine(intranode_buffer_ptrs_gpu,
                                      send_head.data_ptr<int>(),
                                      num_channels,
                                      num_recv_tokens,
                                      num_channels * num_ranks * 2,
-                                     barrier_signal_ptrs_gpu,
+                                     intranode_barrier_signal_ptrs_gpu,
                                      rank,
                                      num_ranks,
                                      comm_stream);
@@ -930,7 +931,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        num_recv_tokens,
                        hidden,
                        num_topk,
-                       buffer_ptrs_gpu,
+                       intranode_buffer_ptrs_gpu,
                        rank,
                        num_ranks,
                        comm_stream,

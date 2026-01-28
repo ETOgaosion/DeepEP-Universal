@@ -17,6 +17,17 @@ namespace intranode {
 
 #ifndef DISABLE_NVSHMEM
 
+#define LAUNCH_KERNEL_SIMPLE(num_blocks, num_threads, stream, kernel, ...)                              \
+    do {                                                                                                \
+        kernel<<<(num_blocks), (num_threads), 0, (stream)>>>(__VA_ARGS__);                              \
+        cudaError_t e = cudaGetLastError();                                                             \
+        if (e != cudaSuccess) {                                                                         \
+            EPException cuda_exception("CUDA", __FILE__, __LINE__, cudaGetErrorString(e));              \
+            fprintf(stderr, "%s\n", cuda_exception.what());                                             \
+            throw cuda_exception;                                                                       \
+        }                                                                                               \
+    } while (0)
+
 namespace {
 
 __device__ __forceinline__ int* get_raw_counts_ptr(void* base_ptr, int num_ranks) {
@@ -54,7 +65,9 @@ __device__ __forceinline__ ChannelBuffers get_channel_buffers(void* base_ptr, in
     const int64_t channel_meta_bytes = channel_meta_elems * sizeof(int);
     const int64_t channel_head_offset = offset + channel_meta_bytes * 2;
 
-    const int64_t data_offset = offset + channel_meta_bytes * 4;
+    int64_t data_offset = offset + channel_meta_bytes * 4;
+    // Ensure int4 payloads are 16-byte aligned.
+    data_offset = (data_offset + 15) & ~static_cast<int64_t>(15);
 
     const int64_t x_bytes_per_channel_rank = static_cast<int64_t>(num_recv_buffer_tokens) * hidden_int4 * sizeof(int4);
     const int64_t src_idx_bytes_per_channel_rank = static_cast<int64_t>(num_recv_buffer_tokens) * sizeof(int);
@@ -421,20 +434,18 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
     (void)barrier_signal_ptrs;
     (void)num_channels;
 
-    SETUP_LAUNCH_CONFIG(1, 256, stream);
-    LAUNCH_KERNEL(&cfg, write_local_counts,
-                  num_tokens_per_rank, num_tokens_per_expert, num_ranks, num_experts, buffer_ptrs);
+    LAUNCH_KERNEL_SIMPLE(1, 256, stream, write_local_counts,
+                         num_tokens_per_rank, num_tokens_per_expert, num_ranks, num_experts, buffer_ptrs);
 
     nvshmemx_barrier_all_on_stream(stream);
 
-    SETUP_LAUNCH_CONFIG(1, 1, stream);
-    LAUNCH_KERNEL(&cfg, gather_counts,
-                  num_tokens_per_rank, moe_recv_counter_mapped, num_ranks,
-                  num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts,
-                  expert_alignment, rank_prefix_matrix_copy, rank, buffer_ptrs);
+    LAUNCH_KERNEL_SIMPLE(1, 1, stream, gather_counts,
+                         num_tokens_per_rank, moe_recv_counter_mapped, num_ranks,
+                         num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts,
+                         expert_alignment, rank_prefix_matrix_copy, rank, buffer_ptrs);
 
-    SETUP_LAUNCH_CONFIG(ceil_div(num_ranks * num_channels, 256), 256, stream);
-    LAUNCH_KERNEL(&cfg, fill_int, channel_prefix_matrix, 0, num_ranks * num_channels);
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_ranks * num_channels, 256), 256, stream,
+                         fill_int, channel_prefix_matrix, 0, num_ranks * num_channels);
 #else
     (void)num_tokens_per_rank;
     (void)moe_recv_counter_mapped;
@@ -464,8 +475,8 @@ void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
     (void)num_memset_int;
     (void)barrier_signal_ptrs;
     (void)rank;
-    SETUP_LAUNCH_CONFIG(ceil_div(num_ranks * num_ranks, 256), 256, stream);
-    LAUNCH_KERNEL(&cfg, copy_rank_prefix_to_buffer, rank_prefix_matrix, num_ranks, buffer_ptrs);
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_ranks * num_ranks, 256), 256, stream,
+                         copy_rank_prefix_to_buffer, rank_prefix_matrix, num_ranks, buffer_ptrs);
 #else
     (void)rank_prefix_matrix;
     (void)num_memset_int;
@@ -493,32 +504,29 @@ void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* re
     (void)num_worst_tokens;
     const int num_channels = num_sms > 0 ? num_sms / 2 : 1;
 
-    SETUP_LAUNCH_CONFIG(1, 256, stream);
-    LAUNCH_KERNEL(&cfg, clear_channel_head,
-                  num_ranks, num_experts, num_channels, num_recv_buffer_tokens, hidden_int4, num_topk, num_scales,
-                  buffer_ptrs);
+    LAUNCH_KERNEL_SIMPLE(1, 256, stream, clear_channel_head,
+                         num_ranks, num_experts, num_channels, num_recv_buffer_tokens, hidden_int4, num_topk, num_scales,
+                         buffer_ptrs);
 
-    SETUP_LAUNCH_CONFIG(ceil_div(num_tokens, 256), 256, stream);
-    LAUNCH_KERNEL(&cfg, dispatch_send,
-                  buffer_ptrs, rank, num_ranks, num_experts, num_channels,
-                  is_token_in_rank,
-                  reinterpret_cast<const int4*>(x), x_scales, topk_idx, topk_weights,
-                  num_tokens, num_topk, num_scales, hidden_int4, scale_token_stride, scale_hidden_stride,
-                  num_recv_buffer_tokens);
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens, 256), 256, stream, dispatch_send,
+                         buffer_ptrs, rank, num_ranks, num_experts, num_channels,
+                         is_token_in_rank,
+                         reinterpret_cast<const int4*>(x), x_scales, topk_idx, topk_weights,
+                         num_tokens, num_topk, num_scales, hidden_int4, scale_token_stride, scale_hidden_stride,
+                         num_recv_buffer_tokens);
 
     nvshmemx_barrier_all_on_stream(stream);
 
-    SETUP_LAUNCH_CONFIG(ceil_div(num_recv_buffer_tokens, 256), 256, stream);
-    LAUNCH_KERNEL(&cfg, dispatch_copy_local,
-                  buffer_ptrs, rank, num_ranks, num_experts, num_channels,
-                  reinterpret_cast<int4*>(recv_x), recv_x_scales,
-                  recv_src_idx, recv_topk_idx, recv_topk_weights,
-                  num_topk, num_scales, hidden_int4, num_recv_buffer_tokens);
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_buffer_tokens, 256), 256, stream, dispatch_copy_local,
+                         buffer_ptrs, rank, num_ranks, num_experts, num_channels,
+                         reinterpret_cast<int4*>(recv_x), recv_x_scales,
+                         recv_src_idx, recv_topk_idx, recv_topk_weights,
+                         num_topk, num_scales, hidden_int4, num_recv_buffer_tokens);
 
-    SETUP_LAUNCH_CONFIG(ceil_div(num_tokens * num_ranks, 256), 256, stream);
-    LAUNCH_KERNEL(&cfg, fill_int, send_head, -1, num_tokens * num_ranks);
-    SETUP_LAUNCH_CONFIG(ceil_div(num_ranks * num_channels, 256), 256, stream);
-    LAUNCH_KERNEL(&cfg, fill_int, recv_channel_offset, 0, num_ranks * num_channels);
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens * num_ranks, 256), 256, stream,
+                         fill_int, send_head, -1, num_tokens * num_ranks);
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_ranks * num_channels, 256), 256, stream,
+                         fill_int, recv_channel_offset, 0, num_ranks * num_channels);
 #else
     (void)recv_x;
     (void)recv_x_scales;
@@ -594,30 +602,30 @@ void combine(cudaDataType_t type,
 
     switch (type) {
         case CUDA_R_16BF: {
-            SETUP_LAUNCH_CONFIG(ceil_div(num_recv_tokens * hidden, 256), 256, stream);
-            LAUNCH_KERNEL(&cfg, init_output<nv_bfloat16>,
-                          reinterpret_cast<nv_bfloat16*>(recv_x),
-                          reinterpret_cast<const nv_bfloat16*>(bias_0),
-                          reinterpret_cast<const nv_bfloat16*>(bias_1),
-                          num_recv_tokens, hidden);
+            LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_tokens * hidden, 256), 256, stream,
+                                 init_output<nv_bfloat16>,
+                                 reinterpret_cast<nv_bfloat16*>(recv_x),
+                                 reinterpret_cast<const nv_bfloat16*>(bias_0),
+                                 reinterpret_cast<const nv_bfloat16*>(bias_1),
+                                 num_recv_tokens, hidden);
             break;
         }
         case CUDA_R_16F: {
-            SETUP_LAUNCH_CONFIG(ceil_div(num_recv_tokens * hidden, 256), 256, stream);
-            LAUNCH_KERNEL(&cfg, init_output<half>,
-                          reinterpret_cast<half*>(recv_x),
-                          reinterpret_cast<const half*>(bias_0),
-                          reinterpret_cast<const half*>(bias_1),
-                          num_recv_tokens, hidden);
+            LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_tokens * hidden, 256), 256, stream,
+                                 init_output<half>,
+                                 reinterpret_cast<half*>(recv_x),
+                                 reinterpret_cast<const half*>(bias_0),
+                                 reinterpret_cast<const half*>(bias_1),
+                                 num_recv_tokens, hidden);
             break;
         }
         case CUDA_R_32F: {
-            SETUP_LAUNCH_CONFIG(ceil_div(num_recv_tokens * hidden, 256), 256, stream);
-            LAUNCH_KERNEL(&cfg, init_output<float>,
-                          reinterpret_cast<float*>(recv_x),
-                          reinterpret_cast<const float*>(bias_0),
-                          reinterpret_cast<const float*>(bias_1),
-                          num_recv_tokens, hidden);
+            LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_tokens * hidden, 256), 256, stream,
+                                 init_output<float>,
+                                 reinterpret_cast<float*>(recv_x),
+                                 reinterpret_cast<const float*>(bias_0),
+                                 reinterpret_cast<const float*>(bias_1),
+                                 num_recv_tokens, hidden);
             break;
         }
         default:
@@ -625,51 +633,53 @@ void combine(cudaDataType_t type,
     }
 
     if (recv_topk_weights != nullptr && num_topk > 0) {
-        SETUP_LAUNCH_CONFIG(ceil_div(num_recv_tokens * num_topk, 256), 256, stream);
-        LAUNCH_KERNEL(&cfg, fill_float, recv_topk_weights, 0.0f, num_recv_tokens * num_topk);
+        LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_tokens * num_topk, 256), 256, stream,
+                             fill_float, recv_topk_weights, 0.0f, num_recv_tokens * num_topk);
     }
 
-    SETUP_LAUNCH_CONFIG(1, 256, stream);
-    LAUNCH_KERNEL(&cfg, clear_channel_head,
-                  num_ranks, 0, num_channels, num_recv_buffer_tokens, hidden_int4, num_topk, 0,
-                  buffer_ptrs);
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_ranks * num_ranks, 256), 256, stream,
+                         copy_rank_prefix_to_buffer, rank_prefix_matrix, num_ranks, buffer_ptrs);
 
-    SETUP_LAUNCH_CONFIG(ceil_div(num_recv_buffer_tokens, 256), 256, stream);
-    LAUNCH_KERNEL(&cfg, clear_src_idx_buffer,
-                  buffer_ptrs, rank, num_ranks, 0, num_channels,
-                  num_recv_buffer_tokens, hidden_int4, num_topk, 0);
+    LAUNCH_KERNEL_SIMPLE(1, 256, stream, clear_channel_head,
+                         num_ranks, 0, num_channels, num_recv_buffer_tokens, hidden_int4, num_topk, 0,
+                         buffer_ptrs);
 
-    SETUP_LAUNCH_CONFIG(ceil_div(num_tokens, 256), 256, stream);
-    LAUNCH_KERNEL(&cfg, combine_send,
-                  buffer_ptrs, rank, num_ranks, 0, num_channels,
-                  reinterpret_cast<const int4*>(x), topk_weights,
-                  src_idx, num_tokens, num_topk, hidden_int4, num_recv_buffer_tokens);
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_buffer_tokens, 256), 256, stream,
+                         clear_src_idx_buffer,
+                         buffer_ptrs, rank, num_ranks, 0, num_channels,
+                         num_recv_buffer_tokens, hidden_int4, num_topk, 0);
+
+    LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens, 256), 256, stream,
+                         combine_send,
+                         buffer_ptrs, rank, num_ranks, 0, num_channels,
+                         reinterpret_cast<const int4*>(x), topk_weights,
+                         src_idx, num_tokens, num_topk, hidden_int4, num_recv_buffer_tokens);
 
     nvshmemx_barrier_all_on_stream(stream);
 
     switch (type) {
         case CUDA_R_16BF: {
-            SETUP_LAUNCH_CONFIG(ceil_div(num_recv_buffer_tokens, 256), 256, stream);
-            LAUNCH_KERNEL(&cfg, combine_reduce<nv_bfloat16>,
-                          buffer_ptrs, rank, num_ranks, 0, num_channels,
-                          reinterpret_cast<nv_bfloat16*>(recv_x), recv_topk_weights,
-                          num_recv_tokens, hidden, num_topk, hidden_int4, num_recv_buffer_tokens);
+            LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_buffer_tokens, 256), 256, stream,
+                                 combine_reduce<nv_bfloat16>,
+                                 buffer_ptrs, rank, num_ranks, 0, num_channels,
+                                 reinterpret_cast<nv_bfloat16*>(recv_x), recv_topk_weights,
+                                 num_recv_tokens, hidden, num_topk, hidden_int4, num_recv_buffer_tokens);
             break;
         }
         case CUDA_R_16F: {
-            SETUP_LAUNCH_CONFIG(ceil_div(num_recv_buffer_tokens, 256), 256, stream);
-            LAUNCH_KERNEL(&cfg, combine_reduce<half>,
-                          buffer_ptrs, rank, num_ranks, 0, num_channels,
-                          reinterpret_cast<half*>(recv_x), recv_topk_weights,
-                          num_recv_tokens, hidden, num_topk, hidden_int4, num_recv_buffer_tokens);
+            LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_buffer_tokens, 256), 256, stream,
+                                 combine_reduce<half>,
+                                 buffer_ptrs, rank, num_ranks, 0, num_channels,
+                                 reinterpret_cast<half*>(recv_x), recv_topk_weights,
+                                 num_recv_tokens, hidden, num_topk, hidden_int4, num_recv_buffer_tokens);
             break;
         }
         case CUDA_R_32F: {
-            SETUP_LAUNCH_CONFIG(ceil_div(num_recv_buffer_tokens, 256), 256, stream);
-            LAUNCH_KERNEL(&cfg, combine_reduce<float>,
-                          buffer_ptrs, rank, num_ranks, 0, num_channels,
-                          reinterpret_cast<float*>(recv_x), recv_topk_weights,
-                          num_recv_tokens, hidden, num_topk, hidden_int4, num_recv_buffer_tokens);
+            LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_buffer_tokens, 256), 256, stream,
+                                 combine_reduce<float>,
+                                 buffer_ptrs, rank, num_ranks, 0, num_channels,
+                                 reinterpret_cast<float*>(recv_x), recv_topk_weights,
+                                 num_recv_tokens, hidden, num_topk, hidden_int4, num_recv_buffer_tokens);
             break;
         }
         default:

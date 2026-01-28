@@ -79,7 +79,7 @@ def _run_all_to_all(args: argparse.Namespace, local_rank: int, num_ranks: int, r
         2,
     )
 
-    recv_x, _, _, _, handle, event = buffer.dispatch(
+    recv_x, _, _, _, handle, event = buffer.dispatch_nvshmem(
         x,
         num_tokens_per_rank=num_tokens_per_rank,
         is_token_in_rank=is_token_in_rank,
@@ -100,11 +100,11 @@ def _run_all_to_all(args: argparse.Namespace, local_rank: int, num_ranks: int, r
     rank_prefix_matrix = handle[0]
     _check_recv_by_rank(recv_x, rank_prefix_matrix, rank, num_ranks)
 
-    combined_x, _, event = buffer.combine(recv_x, handle, config=config, async_finish=False)
+    combined_x, _, event = buffer.combine_nvshmem(recv_x, handle, config=config, async_finish=False)
     if getattr(event, "event", None) is not None:
         event.current_stream_wait()
 
-    if not torch.equal(combined_x.to("cpu"), x.to("cpu")):
+    if not torch.equal(combined_x, x):
         raise AssertionError("combined_x does not match original x")
     else:
         if local_rank == 0:
