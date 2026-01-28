@@ -1,42 +1,14 @@
-# DeepEP
+# DeepEP-Universal
 
 DeepEP is a communication library tailored for Mixture-of-Experts (MoE) and expert parallelism (EP). It provides high-throughput and low-latency all-to-all GPU kernels, which are also known as MoE dispatch and combine. The library also supports low-precision operations, including FP8.
+
+DeepEP-Universal is a library trying to use deepep in all common GPUs, including RTX 5090, or machines without IBGDA.
 
 To align with the group-limited gating algorithm proposed in the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) paper, DeepEP offers a set of kernels optimized for asymmetric-domain bandwidth forwarding, such as forwarding data from NVLink domain to RDMA domain. These kernels deliver high throughput, making them suitable for both training and inference prefilling tasks. Additionally, they support SM (Streaming Multiprocessors) number control.
 
 For latency-sensitive inference decoding, DeepEP includes a set of low-latency kernels with pure RDMA to minimize delays. The library also introduces a hook-based communication-computation overlapping method that does not occupy any SM resource.
 
 Notice: the implementation in this library may have some slight differences from the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) paper.
-
-## Performance
-
-### Normal kernels with NVLink and RDMA forwarding
-
-We test normal kernels on H800 (~160 GB/s NVLink maximum bandwidth), with each connected to a CX7 InfiniBand 400 Gb/s RDMA network card (~50 GB/s maximum bandwidth). And we follow the DeepSeek-V3/R1 pretraining setting (4096 tokens per batch, 7168 hidden, top-4 groups, top-8 experts, FP8 dispatching and BF16 combining).
-
-|   Type    | Dispatch #EP | Bottleneck bandwidth | Combine #EP | Bottleneck bandwidth |
-|:---------:|:------------:|:--------------------:|:-----------:|:--------------------:|
-| Intranode |      8       |  153 GB/s (NVLink)   |      8      |  158 GB/s (NVLink)   |
-| Internode |      16      |    43 GB/s (RDMA)    |     16      |    43 GB/s (RDMA)    |
-| Internode |      32      |    58 GB/s (RDMA)    |     32      |    57 GB/s (RDMA)    |
-| Internode |      64      |    51 GB/s (RDMA)    |     64      |    50 GB/s (RDMA)    |
-
-**News (2025.04.22)**: with optimizations from Tencent Network Platform Department, performance was enhanced by up to 30%, see [#130](https://github.com/deepseek-ai/DeepEP/pull/130) for more details. Thanks for the contribution!
-
-### Low-latency kernels with pure RDMA
-
-We test low-latency kernels on H800 with each connected to a CX7 InfiniBand 400 Gb/s RDMA network card (~50 GB/s maximum bandwidth). And we follow a typical DeepSeek-V3/R1 production setting (128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining).
-
-| Dispatch #EP | Latency | RDMA bandwidth | Combine #EP | Latency | RDMA bandwidth |
-|:------------:|:-------:|:--------------:|:-----------:|:-------:|:--------------:|
-|      8       |  77 us  |    98 GB/s     |      8      | 114 us  |    127 GB/s    |
-|      16      | 118 us  |    63 GB/s     |     16      | 195 us  |    74 GB/s     |
-|      32      | 155 us  |    48 GB/s     |     32      | 273 us  |    53 GB/s     |
-|      64      | 173 us  |    43 GB/s     |     64      | 314 us  |    46 GB/s     |
-|     128      | 192 us  |    39 GB/s     |     128     | 369 us  |    39 GB/s     |
-|     256      | 194 us  |    39 GB/s     |     256     | 360 us  |    40 GB/s     |
-
-**News (2025.06.05)**: low-latency kernels now leverage NVLink as much as possible, see [#173](https://github.com/deepseek-ai/DeepEP/pull/173) for more details. Thanks for the contribution!
 
 ## Quick start
 
@@ -45,37 +17,28 @@ We test low-latency kernels on H800 with each connected to a CX7 InfiniBand 400 
 - Ampere (SM80), Hopper (SM90) GPUs, Blackwell(SM120) GPUs
 - Python 3.8 and above
 - CUDA version
-  - CUDA 11.0 and above for SM80 GPUs
-  - CUDA 12.3 and above for SM90 GPUs
-  - CUDA 12.8 and above for SM120 GPUs
-- PyTorch 2.1 and above
-- P2P Support for intranode communication
-- RDMA network for internode communication
+  - CUDA 12.8 tested
+- PyTorch 2.8.0+cu128 tested
+- NVSHMEM support
+
+To use 5090, you should enable P2P access, follow [this repo](https://github.com/aikitoria/open-gpu-kernel-modules/tree/580.82.09-p2p)
 
 ### Download and install NVSHMEM dependency
 
-See [third-party/nvshmem]()
+See [third-party/nvshmem](./third-party/)
 
-### Development
+### Docker
 
-```bash
-# Build and make symbolic links for SO files
-NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
-# You may modify the specific SO names according to your own platform
-ln -s build/lib.linux-x86_64-cpython-38/deep_ep_cpp.cpython-38-x86_64-linux-gnu.so
-
-# Run test cases
-# NOTES: you may modify the `init_dist` function in `tests/utils.py`
-# according to your own cluster settings, and launch into multiple nodes
-python tests/test_intranode.py
-python tests/test_internode.py
-python tests/test_low_latency.py
-```
+Use whatcanyousee/deepep-universal:v0.1-pytorch25.02 , nvshmem is already installed
 
 ### Installation
 
 ```bash
-NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install
+source scripts/env.sh
+TORCH_CUDA_ARCH_LIST=xxx python setup.py install
+
+# RTX 5090
+DISABLE_AGGRESSIVE_PTX_INSTRS=1 TORCH_CUDA_ARCH_LIST="12.0" python setup.py install
 ```
 
 #### Installation environment variables
@@ -86,6 +49,10 @@ NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install
 - `DISABLE_AGGRESSIVE_PTX_INSTRS`: 0 or 1, whether to disable aggressive load/store instructions, see [Undefined-behavior PTX usage](#undefined-behavior-ptx-usage) for more details
 
 Then, import `deep_ep` in your Python project, and enjoy!
+
+### Test intranode (NVSHMEM)
+
+Run: `python tests/functional_tests/test_intranode_nvshmem.py`
 
 ## Network configurations
 
@@ -116,7 +83,50 @@ Congestion control is disabled as we have not observed significant congestion in
 
 ## Interfaces and examples
 
-### Example use in model training or inference prefilling
+### Example use in model training
+
+### Example: intranode NVSHMEM all-to-all
+
+Use the explicit NVSHMEM APIs (`dispatch_nvshmem` / `combine_nvshmem`) to ensure the intranode NVSHMEM path is used.
+
+```python
+import torch
+import torch.distributed as dist
+from deep_ep import Buffer, Config
+
+def run_intranode_nvshmem(group: dist.ProcessGroup, num_tokens: int, hidden: int):
+    rank = group.rank()
+    num_ranks = group.size()
+    device = torch.device("cuda", rank)
+
+    x = torch.full((num_tokens, hidden), float(rank), dtype=torch.bfloat16, device=device)
+    token_idx = torch.arange(num_tokens, device=device)
+    dst_rank = (token_idx + rank) % num_ranks
+    is_token_in_rank = torch.zeros((num_tokens, num_ranks), dtype=torch.bool, device=device)
+    is_token_in_rank.scatter_(1, dst_rank.view(-1, 1), True)
+    num_tokens_per_rank = is_token_in_rank.to(torch.int32).sum(dim=0, dtype=torch.int32).contiguous()
+    num_tokens_per_expert = num_tokens_per_rank.clone().contiguous()
+
+    # NVSHMEM-only intranode: num_nvl_bytes > 0, num_rdma_bytes == 0
+    config = Config(num_sms=20,
+                    num_max_nvl_chunked_send_tokens=6,
+                    num_max_nvl_chunked_recv_tokens=max(256, num_tokens),
+                    num_max_rdma_chunked_send_tokens=1,
+                    num_max_rdma_chunked_recv_tokens=2)
+    hidden_bytes = hidden * torch.tensor([], dtype=torch.bfloat16).element_size()
+    num_nvl_bytes = int(config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks))
+    buffer = Buffer(group, num_nvl_bytes, 0)
+
+    recv_x, _, _, _, handle, _ = buffer.dispatch_nvshmem(
+        x,
+        num_tokens_per_rank=num_tokens_per_rank,
+        is_token_in_rank=is_token_in_rank,
+        num_tokens_per_expert=num_tokens_per_expert,
+        config=config,
+    )
+    combined_x, _, _ = buffer.combine_nvshmem(recv_x, handle, config=config)
+    return combined_x
+```
 
 The normal kernels can be used in model training or the inference prefilling phase (without the backward part) as the below example code shows.
 
@@ -228,67 +238,6 @@ def combine_backward(grad_combined_x: Union[torch.Tensor, Tuple[torch.Tensor, to
 Moreover, inside the dispatch function, we may not know how many tokens to receive for the current rank. So an implicit CPU wait for GPU received count signal will be involved, as the following figure shows.
 
 ![normal](figures/normal.png)
-
-### Example use in inference decoding
-
-The low latency kernels can be used in the inference decoding phase as the below example code shows.
-
-```python
-import torch
-import torch.distributed as dist
-from typing import Tuple, Optional
-
-from deep_ep import Buffer
-
-# Communication buffer (will allocate at runtime)
-# NOTES: there is no SM control API for the low-latency kernels
-_buffer: Optional[Buffer] = None
-
-
-# You may call this function at the framework initialization
-def get_buffer(group: dist.ProcessGroup, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> Buffer:
-    # NOTES: the low-latency mode will consume much more space than the normal mode
-    # So we recommend that `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
-    global _buffer
-    num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts)
-
-    # Allocate a buffer if not existed or not enough buffer size
-    if _buffer is None or _buffer.group != group or not _buffer.low_latency_mode or _buffer.num_rdma_bytes < num_rdma_bytes:
-        # NOTES: for the best performance, the QP number **must** be equal to the number of the local experts
-        assert num_experts % group.size() == 0
-        _buffer = Buffer(group, 0, num_rdma_bytes, low_latency_mode=True, num_qps_per_rank=num_experts // group.size())
-    return _buffer
-
-
-def low_latency_dispatch(hidden_states: torch.Tensor, topk_idx: torch.Tensor, num_max_dispatch_tokens_per_rank: int, num_experts: int):
-    global _buffer
-
-    # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
-    recv_hidden_states, recv_expert_count, handle, event, hook = \
-        _buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts,
-                                     async_finish=False, return_recv_hook=True)
-
-    # NOTES: the actual tensor will not be received only if you call `hook()`,
-    # it is useful for double-batch overlapping, but **without any SM occupation**
-    # If you don't want to overlap, please set `return_recv_hook=False`
-    # Later, you can use our GEMM library to do the computation with this specific format
-    return recv_hidden_states, recv_expert_count, handle, event, hook
-
-
-def low_latency_combine(hidden_states: torch.Tensor,
-                        topk_idx: torch.Tensor, topk_weights: torch.Tensor, handle: Tuple):
-    global _buffer
-
-    # Do MoE combine, compatible with CUDA graph (but you may restore some buffer status once you replay)
-    combined_hidden_states, event_overlap, hook = \
-        _buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle,
-                                    async_finish=False, return_recv_hook=True)
-
-    # NOTES: the same behavior as described in the dispatch kernel
-    return combined_hidden_states, event_overlap, hook
-```
-
-For two-micro-batch overlapping, you can refer to the following figure. With our receiving hook interface, the RDMA network traffic is happening in the background, without costing any GPU SMs from the computation part. But notice, the overlapped parts can be adjusted, i.e., the 4 parts of attention/dispatch/MoE/combine may not have the exact same execution time. You may adjust the stage settings according to your workload.
 
 ![low-latency](figures/low-latency.png)
 
