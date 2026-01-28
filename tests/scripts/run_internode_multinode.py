@@ -101,9 +101,13 @@ def main(argv=None):
             script_args += ["--num-topk-groups", str(args.num_topk_groups)]
         python_bin = os.getenv("PYTHON") or "python"
         arg_str = " ".join(shlex.quote(str(a)) for a in script_args)
+        conda_sh = os.getenv("CONDA_SH", "$HOME/miniconda3/etc/profile.d/conda.sh")
+        conda_env = os.getenv("CONDA_ENV", "deepep")
         return (
-            f"cd {shlex.quote(str(repo_root))} && {env_prefix} "
-            f"{shlex.quote(python_bin)} tests/functional_tests/test_internode.py {arg_str}"
+            f"cd {shlex.quote(str(repo_root))} && "
+            f"source {conda_sh} && conda activate {shlex.quote(conda_env)} && "
+            f"{env_prefix} {shlex.quote(python_bin)} "
+            f"tests/functional_tests/test_internode.py {arg_str}"
         ).strip()
 
     client_kwargs = {}
