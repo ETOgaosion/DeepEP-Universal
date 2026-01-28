@@ -159,6 +159,7 @@ Buffer::Buffer(int rank,
     EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
     if (num_rdma_bytes > 0)
         EP_HOST_ASSERT(num_ranks > NUM_MAX_NVL_PEERS or low_latency_mode);
+    use_nvshmem_intranode = (num_nvl_bytes > 0 && num_rdma_bytes == 0);
 
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -267,7 +268,8 @@ pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
 torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
     torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
     auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
-    auto base_ptr = static_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
+    auto* base_ptr = static_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr :
+                      (use_nvshmem_intranode ? intranode_nvshmem_buffer_ptr : buffer_ptrs[nvl_rank])) + offset;
     auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
@@ -282,7 +284,7 @@ void Buffer::destroy() {
     // Synchronize
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    if (num_nvl_bytes > 0) {
+    if (num_nvl_bytes > 0 && !use_nvshmem_intranode) {
         // Barrier
         intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -300,7 +302,7 @@ void Buffer::destroy() {
 
     // Free NVSHMEM
 #ifndef DISABLE_NVSHMEM
-    if (is_available() and num_rdma_bytes > 0) {
+    if (is_available() and (num_rdma_bytes > 0 || use_nvshmem_intranode)) {
         CUDA_CHECK(cudaDeviceSynchronize());
         internode::barrier();
         internode::free(rdma_buffer_ptr);
@@ -311,6 +313,11 @@ void Buffer::destroy() {
         internode::finalize();
     }
 #endif
+
+    if (intranode_nvshmem_buffer_ptrs_gpu != nullptr) {
+        CUDA_CHECK(cudaFree(intranode_nvshmem_buffer_ptrs_gpu));
+        intranode_nvshmem_buffer_ptrs_gpu = nullptr;
+    }
 
     // Free workspace and MoE counter
     CUDA_CHECK(cudaFree(workspace));
@@ -328,8 +335,31 @@ void Buffer::sync(const std::vector<int>& device_ids,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
 
+    // Enable peer access on the local device for visible peers.
+    int current_device = 0;
+    CUDA_CHECK(cudaGetDevice(&current_device));
+    const int local_device = current_device;
+    for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++ i) {
+        int peer_rank = offset + i;
+        EP_HOST_ASSERT(peer_rank < static_cast<int>(device_ids.size()));
+        int peer_device = device_ids[peer_rank];
+        if (peer_device == local_device)
+            continue;
+        int can_access = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, local_device, peer_device));
+        if (can_access) {
+            cudaError_t err = cudaDeviceEnablePeerAccess(peer_device, 0);
+            if (err == cudaErrorPeerAccessAlreadyEnabled) {
+                cudaGetLastError();
+            } else if (err != cudaSuccess) {
+                throw EPException("CUDA", __FILE__, __LINE__, cudaGetErrorString(err));
+            }
+        }
+    }
+    CUDA_CHECK(cudaSetDevice(current_device));
+
     // Sync IPC handles
-    if (num_nvl_bytes > 0) {
+    if (num_nvl_bytes > 0 && !use_nvshmem_intranode) {
         EP_HOST_ASSERT(num_ranks == device_ids.size());
         EP_HOST_ASSERT(device_ids.size() == all_gathered_handles.size());
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
@@ -353,22 +383,34 @@ void Buffer::sync(const std::vector<int>& device_ids,
 
     // Sync NVSHMEM handles and allocate memory
 #ifndef DISABLE_NVSHMEM
-    if (num_rdma_bytes > 0) {
+    if (num_rdma_bytes > 0 || use_nvshmem_intranode) {
         // Initialize NVSHMEM
         EP_HOST_ASSERT(root_unique_id_opt.has_value());
         std::vector<uint8_t> root_unique_id(root_unique_id_opt->size());
         auto root_unique_id_str = root_unique_id_opt->cast<std::string>();
         std::memcpy(root_unique_id.data(), root_unique_id_str.c_str(), root_unique_id_opt->size());
-        auto nvshmem_rank = low_latency_mode ? rank : rdma_rank;
-        auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+        auto nvshmem_rank = use_nvshmem_intranode ? rank : (low_latency_mode ? rank : rdma_rank);
+        auto num_nvshmem_ranks = use_nvshmem_intranode ? num_ranks : (low_latency_mode ? num_ranks : num_rdma_ranks);
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
         // Allocate
-        rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+        if (num_rdma_bytes > 0)
+            rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+        if (use_nvshmem_intranode) {
+            intranode_nvshmem_buffer_ptr = internode::alloc(num_nvl_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+            for (int i = 0; i < num_nvl_ranks; ++ i)
+                intranode_nvshmem_buffer_ptrs[i] = intranode_nvshmem_buffer_ptr;
+            CUDA_CHECK(cudaMalloc(&intranode_nvshmem_buffer_ptrs_gpu, sizeof(void*) * NUM_MAX_NVL_PEERS));
+            CUDA_CHECK(cudaMemcpy(intranode_nvshmem_buffer_ptrs_gpu, intranode_nvshmem_buffer_ptrs,
+                                  sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
+        }
 
         // Clean buffer (mainly for low-latency mode)
-        CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
+        if (rdma_buffer_ptr != nullptr)
+            CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
+        if (intranode_nvshmem_buffer_ptr != nullptr)
+            CUDA_CHECK(cudaMemset(intranode_nvshmem_buffer_ptr, 0, num_nvl_bytes));
 
         // Allocate and clean shrink buffer
         if (enable_shrink) {
@@ -578,6 +620,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     auto rank_prefix_matrix = torch::Tensor();
     auto channel_prefix_matrix = torch::Tensor();
     std::vector<int> num_recv_tokens_per_expert_list;
+    auto* intranode_buffer_ptrs_gpu = use_nvshmem_intranode ? intranode_nvshmem_buffer_ptrs_gpu : buffer_ptrs_gpu;
+    auto* intranode_barrier_signal_ptrs_gpu = use_nvshmem_intranode ? nullptr : barrier_signal_ptrs_gpu;
 
     // Barrier or send sizes
     // To clean: channel start/end offset, head and tail
@@ -651,6 +695,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
     }
+
+    if (use_nvshmem_intranode)
+        EP_HOST_ASSERT(num_recv_tokens <= config.num_max_nvl_chunked_recv_tokens);
 
     // Allocate new tensors
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
@@ -830,6 +877,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
+
+    auto* intranode_buffer_ptrs_gpu = use_nvshmem_intranode ? intranode_nvshmem_buffer_ptrs_gpu : buffer_ptrs_gpu;
+    auto* intranode_barrier_signal_ptrs_gpu = use_nvshmem_intranode ? nullptr : barrier_signal_ptrs_gpu;
+
+    if (use_nvshmem_intranode)
+        EP_HOST_ASSERT(num_recv_tokens <= config.num_max_nvl_chunked_recv_tokens);
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);

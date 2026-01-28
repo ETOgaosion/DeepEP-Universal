@@ -6,3 +6,8 @@ build/
 .cache/
 .vscode/
 */cmake-build-*/
+*.so
+*.o
+*.egg-info
+dist/
+__pycache__/

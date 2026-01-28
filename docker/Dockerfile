@@ -9,7 +9,7 @@ RUN wget https://developer.download.nvidia.com/compute/nvshmem/3.5.19/local_inst
     apt-get update && \
     apt-get install -y nvshmem-cuda-12
 
-RUN sed -i 's@//.*archive.ubuntu.com@//mirrors.tuna.tsinghua.edu.cn@g' /etc/apt/sources.list && \
+RUN sed -i 's@//.*archive.ubuntu.com@//mirrors.tuna.tsinghua.edu.cn@g' /etc/apt/sources.list.d/ubuntu.sources && \
     pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 RUN mkdir /usr/local/nvshmem && \

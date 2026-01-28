@@ -11,6 +11,18 @@ import torch.distributed as dist
 from typing import Optional, Union
 
 
+def _can_access_peer(src: int, dst: int) -> bool:
+    try:
+        return torch.cuda.device_can_access_peer(src, dst)
+    except AttributeError:
+        if hasattr(torch.cuda, "can_device_access_peer"):
+            return torch.cuda.can_device_access_peer(src, dst)  # type: ignore[attr-defined]
+        if dist.is_available() and dist.is_initialized():
+            if dist.get_rank() == 0:
+                print("[warn] P2P check API not available; skipping P2P check", flush=True)
+        return True
+
+
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
@@ -32,6 +44,26 @@ def init_dist(local_rank: int, num_local_ranks: int):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
     torch.cuda.set_device(local_rank)
+
+    device_count = torch.cuda.device_count()
+    if num_local_ranks > device_count:
+        raise RuntimeError(
+            f'num_local_ranks ({num_local_ranks}) exceeds visible CUDA devices ({device_count}). '
+            f'Set NUM_PROCESSES or CUDA_VISIBLE_DEVICES accordingly.'
+        )
+    unsupported_peers = []
+    for i in range(num_local_ranks):
+        for j in range(num_local_ranks):
+            if i == j:
+                continue
+            if not _can_access_peer(i, j):
+                unsupported_peers.append((i, j))
+    if unsupported_peers:
+        peer_list = ", ".join([f"{i}->{j}" for i, j in unsupported_peers])
+        raise RuntimeError(
+            'CUDA P2P is required for intranode tests but is not available for some GPU pairs: '
+            f'{peer_list}. Limit NUM_PROCESSES to P2P-capable GPUs or adjust CUDA_VISIBLE_DEVICES.'
+        )
 
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 

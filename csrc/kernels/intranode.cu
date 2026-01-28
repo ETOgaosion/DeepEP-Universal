@@ -560,10 +560,6 @@ void dispatch(void* recv_x,
               int num_max_send_tokens,
               int num_recv_buffer_tokens) {
     constexpr int kNumThreads = 768;
-    constexpr int kNumTMABytesPerWarp = 8192;
-#ifndef DISABLE_SM90_FEATURES
-    constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
-#endif
 
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
@@ -722,12 +718,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
     auto bias_0_int4 = reinterpret_cast<const int4*>(bias_0);
     auto bias_1_int4 = reinterpret_cast<const int4*>(bias_1);
     auto recv_int4 = reinterpret_cast<int4*>(recv_x);
-
-    // TMA stuffs
-#ifndef DISABLE_SM90_FEATURES
-    extern __shared__ __align__(1024) uint8_t smem_buffer[];
-    auto tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp;
-#endif
 
     if (is_sender) {
         // Workers for sending
@@ -1054,10 +1044,6 @@ void combine(cudaDataType_t type,
              int num_max_send_tokens,
              int num_recv_buffer_tokens) {
     constexpr int kNumThreads = 768;
-    constexpr int kNumTMABytesPerWarp = 4096;
-#ifndef DISABLE_SM90_FEATURES
-    constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
-#endif
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks)                                      \
     {                                                                          \

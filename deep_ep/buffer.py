@@ -13,7 +13,7 @@ from .utils import EventOverlap, check_nvlink_connections
 class Buffer:
     """
     The core expert-parallel (EP) communication buffers for Mixture of Experts (MoE) model, which supports:
-        - high-throughput intranode all-to-all (dispatch and combine, using NVLink)
+        - high-throughput intranode all-to-all (dispatch and combine, using NVSHMEM)
         - high-throughput internode all-to-all (dispatch and combine, using RDMA and NVLink)
         - low-latency all-to-all (dispatch and combine, using RDMA)
 
@@ -22,7 +22,7 @@ class Buffer:
         rank: the local rank number.
         group_size: the number of ranks in the group.
         group: the communication group.
-        num_nvl_bytes: the buffer size for intranode NVLink communication.
+        num_nvl_bytes: the buffer size for intranode NVSHMEM communication.
         num_rdma_bytes: the buffer size for internode (also for intranode with low-latency mode) RDMA communication.
         runtime: the C++ runtime.
     """
@@ -46,7 +46,7 @@ class Buffer:
 
         Arguments:
             group: the communication group.
-            num_nvl_bytes: the buffer size for intranode NVLink communication.
+            num_nvl_bytes: the buffer size for intranode NVSHMEM communication.
             num_rdma_bytes: the buffer size for internode (also for intranode with low-latency mode) RDMA communication.
             low_latency_mode: whether to enable low-latency mode.
             num_qps_per_rank: the number of QPs for RDMA, the low-latency mode requires that this number equals
@@ -63,7 +63,9 @@ class Buffer:
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
         """
-        check_nvlink_connections(group)
+        use_nvshmem_intranode = num_nvl_bytes > 0 and num_rdma_bytes == 0
+        if not use_nvshmem_intranode:
+            check_nvlink_connections(group)
 
         # Initialize the CPP runtime
         if group is not None:
@@ -102,7 +104,7 @@ class Buffer:
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
-        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
+        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode or use_nvshmem_intranode:
             # Enable IBGDA
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
@@ -113,23 +115,26 @@ class Buffer:
             self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
             os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
 
-            # Reduce gpu memory usage
-            # 6 default teams + 1 extra team
-            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-            # Disable NVLink SHArP
-            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
-            # NOTES: NVSHMEM initialization requires at least 256 MiB
-            os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+                # Reduce gpu memory usage
+                # 6 default teams + 1 extra team
+                os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+                # Disable NVLink SHArP
+                os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
+                # NOTES: NVSHMEM initialization requires at least 256 MiB
+                os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
 
-            if not allow_mnnvl:
-                # Disable multi-node NVLink detection
-                os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
+                if not allow_mnnvl:
+                    # Disable multi-node NVLink detection
+                    os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
             # Synchronize using the root ID
-            if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
+            if (use_nvshmem_intranode and self.rank == 0) or (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
                 root_unique_id = self.runtime.get_local_nvshmem_unique_id()
             nvshmem_unique_ids = all_gather_object(root_unique_id)
-            root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
+            if use_nvshmem_intranode:
+                root_unique_id = nvshmem_unique_ids[0]
+            else:
+                root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)

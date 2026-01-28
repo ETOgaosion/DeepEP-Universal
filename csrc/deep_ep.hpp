@@ -58,11 +58,15 @@ private:
     // Low-latency mode buffer
     int low_latency_buffer_idx = 0;
     bool low_latency_mode = false;
+    bool use_nvshmem_intranode = false;
 
     // NVLink Buffer
     int64_t num_nvl_bytes;
     void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
     void** buffer_ptrs_gpu = nullptr;
+    void* intranode_nvshmem_buffer_ptr = nullptr;
+    void* intranode_nvshmem_buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    void** intranode_nvshmem_buffer_ptrs_gpu = nullptr;
 
     // NVSHMEM Buffer
     int64_t num_rdma_bytes;

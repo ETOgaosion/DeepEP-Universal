@@ -13,7 +13,7 @@ endfunction()
 
 add_deep_ep_library(runtime_cuda runtime.cu)
 add_deep_ep_library(layout_cuda layout.cu)
-add_deep_ep_library(intranode_cuda intranode.cu)
+add_deep_ep_library(intranode_cuda intranode_nvshmem.cu)
 add_deep_ep_library(internode_cuda internode.cu)
 add_deep_ep_library(internode_ll_cuda internode_ll.cu)
 
