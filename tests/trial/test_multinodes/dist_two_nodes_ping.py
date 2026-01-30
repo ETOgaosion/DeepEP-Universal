@@ -122,8 +122,8 @@ def _run_worker(args):
         if device.type == "cuda":
             local_rank = args.local_rank
             if local_rank is None or local_rank < 0:
-                if args.nnodes and args.nnodes > 0:
-                    local_rank = args.rank % args.nnodes
+                if args.nproc_per_node and args.nproc_per_node > 0:
+                    local_rank = args.rank % args.nproc_per_node
                 else:
                     local_rank_env = os.getenv("LOCAL_RANK")
                     if local_rank_env is not None:
