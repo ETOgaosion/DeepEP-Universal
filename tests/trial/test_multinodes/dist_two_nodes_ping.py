@@ -83,12 +83,12 @@ def _run_worker(args):
             return 3
 
         tensor = torch.arange(2, device=device, dtype=torch.int64) + 1 + args.world_size * args.rank
-        print(f"[rank {args.rank}] initial tensor={tensor.item()}")
+        print(f"[rank {args.rank}] initial tensor={tensor}")
         dist.barrier()
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         dist.barrier()
 
-        print(f"[rank {args.rank}] all_reduce result={tensor.item()}")
+        print(f"[rank {args.rank}] all_reduce result={tensor}")
     finally:
         dist.destroy_process_group()
 
