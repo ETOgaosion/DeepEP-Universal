@@ -182,7 +182,7 @@ def _run_controller(args):
 def main():
     parser = argparse.ArgumentParser(description="Simple 2-node torch.distributed connectivity check.")
     parser.add_argument("--worker", action="store_true", help="Run as worker (do not launch parallel-ssh).")
-    parser.add_argument("--backend", default=os.getenv("DIST_BACKEND", "gloo"), help="Process group backend.")
+    parser.add_argument("--backend", default=os.getenv("DIST_BACKEND", "nccl"), help="Process group backend.")
     parser.add_argument("--rank", type=int, default=int(os.getenv("RANK", "-1")), help="Global rank.")
     parser.add_argument("--world-size", type=int, default=int(os.getenv("WORLD_SIZE", "-1")), help="World size.")
     parser.add_argument("--nnodes", type=int, default=int(os.getenv("NNODES", "0")), help="Number of nodes.")
