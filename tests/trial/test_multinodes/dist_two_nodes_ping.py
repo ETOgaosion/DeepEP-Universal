@@ -135,7 +135,13 @@ def _run_controller(args):
     env_sh = os.getenv("ENV_SH", "")
     env_sh_cmd = f"source {shlex.quote(env_sh)} && " if env_sh else ""
 
-    extra_env = _parse_kv(args.extra_env)
+    extra_env = {}
+    if isinstance(cfg.get("EXTRA_ENVS"), dict):
+        extra_env.update(cfg.get("EXTRA_ENVS"))
+    test_envs = cfg.get("TEST_ENVS", {})
+    if isinstance(test_envs, dict) and isinstance(test_envs.get("dist_two_nodes_ping"), dict):
+        extra_env.update(test_envs.get("dist_two_nodes_ping"))
+    extra_env.update(_parse_kv(args.extra_env))
     commands = []
     for node_rank, host in enumerate(hosts):
         env_items = {
