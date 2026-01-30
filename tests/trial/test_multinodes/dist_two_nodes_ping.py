@@ -140,11 +140,10 @@ def _run_controller(args):
             f"cd {shlex.quote(str(repo_root))} && "
             f"source {conda_sh} && conda activate {shlex.quote(conda_env)} && "
             f"{env_sh_cmd}"
-            f"{env_prefix} torchrun "
+            f"{env_prefix} {shlex.quote(python_bin)} -m torch.distributed.run "
             f"--nnodes {nnodes} --nproc_per_node {nproc_per_node} "
             f"--node_rank {node_rank} "
             f"--master_addr {shlex.quote(master_addr)} --master_port {shlex.quote(str(args.master_port))} "
-            f"{shlex.quote(python_bin)} "
             f"tests/trial/test_multinodes/dist_two_nodes_ping.py --worker"
         ).strip()
         commands.append(cmd)
