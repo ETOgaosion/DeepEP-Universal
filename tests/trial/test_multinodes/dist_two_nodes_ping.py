@@ -36,19 +36,6 @@ def _build_env_exports(env_items):
         parts.append(f"{key}={shlex.quote(str(value))}")
     return " ".join(parts)
 
-class _Tee:
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, data):
-        for stream in self._streams:
-            stream.write(data)
-            stream.flush()
-
-    def flush(self):
-        for stream in self._streams:
-            stream.flush()
-
 def _filter_kwargs(func, kwargs):
     try:
         sig = inspect.signature(func)
@@ -71,23 +58,24 @@ def _parse_kv(items):
 
 
 def _run_worker(args):
-    log_fp = None
-    if args.log_dir:
-        log_dir = Path(args.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        hostname = socket.gethostname()
-        log_path = log_dir / f"dist_two_nodes_ping_rank{args.rank}_{hostname}.log"
-        log_fp = log_path.open("a", buffering=1, encoding="utf-8")
-        sys.stdout = _Tee(sys.stdout, log_fp)
-        sys.stderr = _Tee(sys.stderr, log_fp)
-        print(f"[rank {args.rank}] logging to {log_path}")
+    log_dir = Path(args.log_dir or "tests/trial/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    hostname = socket.gethostname()
+    log_path = log_dir / f"dist_two_nodes_ping_rank{args.rank}_{hostname}.log"
+    log_fp = log_path.open("a", buffering=1, encoding="utf-8")
+
+    def _log(msg):
+        log_fp.write(msg + "\n")
+        log_fp.flush()
+
+    _log(f"[rank {args.rank}] logging to {log_path}")
 
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = str(args.master_port)
 
     timeout = datetime.timedelta(seconds=args.timeout)
 
-    print(
+    _log(
         f"[rank {args.rank}] init_process_group backend={args.backend} "
         f"master={args.master_addr}:{args.master_port} world_size={args.world_size}"
     )
@@ -99,23 +87,26 @@ def _run_worker(args):
         timeout=timeout,
     )
     
-    print(f"[rank {args.rank}] init_process_group complete")
+    _log(f"[rank {args.rank}] init_process_group complete")
 
     try:
         device = torch.device(args.device)
         if device.type == "cuda" and not torch.cuda.is_available():
-            print(f"[rank {args.rank}] cuda requested but not available", file=sys.stderr)
+            _log(f"[rank {args.rank}] cuda requested but not available")
             return 3
 
         tensor = torch.arange(2, device=device, dtype=torch.int64) + 1 + args.world_size * args.rank
-        print(f"[rank {args.rank}] initial tensor={tensor}")
+        _log(f"[rank {args.rank}] initial tensor={tensor}")
         dist.barrier()
+        _log(f"[rank {args.rank}] passed barrier")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        _log(f"[rank {args.rank}] all_reduce complete")
         dist.barrier()
 
-        print(f"[rank {args.rank}] all_reduce result={tensor}")
+        _log(f"[rank {args.rank}] all_reduce result={tensor}")
     finally:
         dist.destroy_process_group()
+        log_fp.close()
         if log_fp is not None:
             log_fp.close()
 
