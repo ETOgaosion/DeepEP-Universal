@@ -195,7 +195,7 @@ def main():
     parser.add_argument("--master-addr", default=os.getenv("MASTER_ADDR", ""), help="Master address.")
     parser.add_argument("--master-port", default=os.getenv("MASTER_PORT", "29500"), help="Master port.")
     parser.add_argument("--timeout", type=int, default=int(os.getenv("DIST_TIMEOUT", "120")), help="Init timeout seconds.")
-    parser.add_argument("--device", default=os.getenv("DIST_DEVICE", "cpu"), help="cpu or cuda.")
+    parser.add_argument("--device", default=os.getenv("DIST_DEVICE", "cuda"), help="cpu or cuda.")
     parser.add_argument("--user", default=os.getenv("SSH_USER"), help="SSH user (optional).")
     parser.add_argument("--identity-file", default=os.getenv("SSH_IDENTITY_FILE"), help="SSH identity file (optional).")
     parser.add_argument("--ssh-port", type=int, default=int(os.getenv("SSH_PORT", "22")), help="SSH port.")
