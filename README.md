@@ -85,7 +85,7 @@ Congestion control is disabled as we have not observed significant congestion in
 
 ### Example use in model training
 
-### Example: intranode NVSHMEM all-to-all
+#### Example: intranode NVSHMEM all-to-all
 
 Use the explicit NVSHMEM APIs (`dispatch_nvshmem` / `combine_nvshmem`) to ensure the intranode NVSHMEM path is used.
 
@@ -127,6 +127,8 @@ def run_intranode_nvshmem(group: dist.ProcessGroup, num_tokens: int, hidden: int
     combined_x, _, _ = buffer.combine_nvshmem(recv_x, handle, config=config)
     return combined_x
 ```
+
+#### Example: normal all-to-all
 
 The normal kernels can be used in model training or the inference prefilling phase (without the backward part) as the below example code shows.
 

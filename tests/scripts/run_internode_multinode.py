@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import inspect
 import json
+import logging
 import os
 import shlex
 import sys
+import time
+import signal
 from pathlib import Path
 
 try:
@@ -30,6 +34,13 @@ def _build_env_exports(env_items):
         parts.append(f"{key}={shlex.quote(str(value))}")
     return " ".join(parts)
 
+def _filter_kwargs(func, kwargs):
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
 
 def main(argv=None):
     repo_root = Path(__file__).resolve().parents[2]
@@ -39,6 +50,13 @@ def main(argv=None):
     parser.add_argument("--user", default=os.getenv("SSH_USER"), help="SSH user (optional).")
     parser.add_argument("--identity-file", default=os.getenv("SSH_IDENTITY_FILE"), help="SSH identity file (optional).")
     parser.add_argument("--timeout", type=int, default=int(os.getenv("PSSH_TIMEOUT", "0")), help="SSH timeout seconds (0 = default).")
+    parser.add_argument("--read-timeout", type=int, default=int(os.getenv("PSSH_READ_TIMEOUT", "0")), help="SSH read timeout seconds (0 = default).")
+    parser.add_argument("--channel-timeout", type=int, default=int(os.getenv("PSSH_CHANNEL_TIMEOUT", "0")), help="SSH channel timeout seconds (0 = default).")
+    parser.add_argument("--join-timeout", type=int, default=int(os.getenv("PSSH_JOIN_TIMEOUT", "0")), help="Join timeout seconds (0 = default).")
+    parser.add_argument("--overall-timeout", type=int, default=int(os.getenv("OVERALL_TIMEOUT", "0")), help="Overall timeout seconds (0 = unlimited).")
+    parser.add_argument("--ssh-port", type=int, default=int(os.getenv("SSH_PORT", "22")), help="SSH port.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging and verbose diagnostics.")
+    parser.add_argument("--preflight-cmd", default=os.getenv("PSSH_PREFLIGHT_CMD", ""), help="Optional command to run on all hosts before the test.")
     # Note: accept the same arguments as tests/functional_tests/test_internode.py
     parser.add_argument("--num-processes", type=int, default=int(os.getenv("NUM_PROCESSES", "8")))
     parser.add_argument("--world-size", type=int, default=int(os.getenv("WORLD_SIZE", "0")))
@@ -103,9 +121,11 @@ def main(argv=None):
         arg_str = " ".join(shlex.quote(str(a)) for a in script_args)
         conda_sh = os.getenv("CONDA_SH", "$HOME/miniconda3/etc/profile.d/conda.sh")
         conda_env = os.getenv("CONDA_ENV", "deepep")
+        env_sh = os.getenv("ENV_SH", "scripts/env.sh")
         return (
             f"cd {shlex.quote(str(repo_root))} && "
             f"source {conda_sh} && conda activate {shlex.quote(conda_env)} && "
+            f"source {shlex.quote(env_sh)} && "
             f"{env_prefix} {shlex.quote(python_bin)} "
             f"tests/functional_tests/test_internode.py {arg_str}"
         ).strip()
@@ -117,6 +137,14 @@ def main(argv=None):
         client_kwargs["pkey"] = args.identity_file
     if args.timeout:
         client_kwargs["timeout"] = args.timeout
+    if args.ssh_port:
+        client_kwargs["port"] = args.ssh_port
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+        print("[debug] hosts:", hosts)
+        print("[debug] repo_root:", repo_root)
+        print("[debug] pssh kwargs:", client_kwargs)
 
     client = ParallelSSHClient(hosts, **client_kwargs)
     commands = [build_cmd(rank) for rank in range(len(hosts))]
@@ -124,12 +152,53 @@ def main(argv=None):
     for host, cmd in zip(hosts, commands):
         print(f"[{host}] cmd: {cmd}")
 
-    output = client.run_command(
-        "%(cmd)s",
-        host_args=[{"cmd": cmd} for cmd in commands],
-        stop_on_errors=False,
-    )
-    client.join(output)
+    run_kwargs = {
+        "host_args": [{"cmd": cmd} for cmd in commands],
+        "stop_on_errors": False,
+    }
+    if args.timeout:
+        run_kwargs["timeout"] = args.timeout
+    if args.read_timeout:
+        run_kwargs["read_timeout"] = args.read_timeout
+    if args.channel_timeout:
+        run_kwargs["channel_timeout"] = args.channel_timeout
+
+    if args.preflight_cmd:
+        preflight_kwargs = dict(run_kwargs)
+        preflight_kwargs["host_args"] = [{"cmd": args.preflight_cmd} for _ in commands]
+        preflight_kwargs = _filter_kwargs(client.run_command, preflight_kwargs)
+        preflight_output = client.run_command("%(cmd)s", **preflight_kwargs)
+        join_kwargs = {"timeout": args.join_timeout} if args.join_timeout else {}
+        join_kwargs = _filter_kwargs(client.join, join_kwargs)
+        client.join(preflight_output, **join_kwargs)
+        for host, host_output in zip(hosts, preflight_output):
+            for line in (host_output.stdout or []):
+                print(f"[{host}][preflight] {line}")
+            for line in (host_output.stderr or []):
+                print(f"[{host}][preflight][stderr] {line}", file=sys.stderr)
+
+    run_kwargs = _filter_kwargs(client.run_command, run_kwargs)
+    output = client.run_command("%(cmd)s", **run_kwargs)
+
+    join_kwargs = {"timeout": args.join_timeout} if args.join_timeout else {}
+    join_kwargs = _filter_kwargs(client.join, join_kwargs)
+
+    def _timeout_handler(_signum, _frame):
+        raise TimeoutError
+
+    start_time = time.monotonic()
+    if args.overall_timeout:
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(args.overall_timeout)
+    try:
+        client.join(output, **join_kwargs)
+    except TimeoutError:
+        elapsed = int(time.monotonic() - start_time)
+        print(f"[timeout] overall timeout exceeded after {elapsed}s", file=sys.stderr)
+        return 2
+    finally:
+        if args.overall_timeout:
+            signal.alarm(0)
 
     exit_code = 0
     for host, host_output in zip(hosts, output):
