@@ -156,13 +156,13 @@ def _run_controller(args):
 
     ssh_master_addr = cfg.get("SSH_MASTER_NODE_ADDR") or cfg.get("MASTER_NODE_ADDR")
     ssh_slave_addrs = list(cfg.get("SSH_SLAVE_NODE_ADDRS", [])) or list(cfg.get("SLAVE_NODE_ADDRS", []))
-    master_addr = cfg.get("MASTER_NODE_IP") or cfg.get("MASTER_NODE_ADDR")
+    master_addr = cfg.get("MASTER_NODE_IP")
     if not ssh_master_addr:
         raise SystemExit("SSH_MASTER_NODE_ADDR (or MASTER_NODE_ADDR) is missing in .secrets/env.json")
     if not ssh_slave_addrs:
         raise SystemExit("SSH_SLAVE_NODE_ADDRS (or SLAVE_NODE_ADDRS) is empty in .secrets/env.json")
     if not master_addr:
-        raise SystemExit("MASTER_NODE_IP (or MASTER_NODE_ADDR) is missing in .secrets/env.json")
+        raise SystemExit("MASTER_NODE_IP is missing in .secrets/env.json")
 
     hosts = [ssh_master_addr] + ssh_slave_addrs
     nnodes = args.nnodes or len(hosts)
