@@ -34,6 +34,19 @@ def _build_env_exports(env_items):
         parts.append(f"{key}={shlex.quote(str(value))}")
     return " ".join(parts)
 
+def _parse_kv(items):
+    if not items:
+        return {}
+    result = {}
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"Invalid --extra-env value '{item}', expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        if not key:
+            raise SystemExit(f"Invalid --extra-env value '{item}', empty key")
+        result[key] = value
+    return result
+
 
 def _run_worker(args):
     os.environ["MASTER_ADDR"] = args.master_addr
@@ -122,6 +135,7 @@ def _run_controller(args):
     env_sh = os.getenv("ENV_SH", "")
     env_sh_cmd = f"source {shlex.quote(env_sh)} && " if env_sh else ""
 
+    extra_env = _parse_kv(args.extra_env)
     commands = []
     for node_rank, host in enumerate(hosts):
         env_items = {
@@ -135,6 +149,7 @@ def _run_controller(args):
             "DIST_TIMEOUT": args.timeout,
             "DIST_DEVICE": args.device,
         }
+        env_items = {**env_items, **extra_env}
         env_prefix = _build_env_exports(env_items)
         cmd = (
             f"cd {shlex.quote(str(repo_root))} && "
@@ -194,11 +209,17 @@ def main():
     )
     parser.add_argument("--master-addr", default=os.getenv("MASTER_ADDR", ""), help="Master address.")
     parser.add_argument("--master-port", default=os.getenv("MASTER_PORT", "29500"), help="Master port.")
-    parser.add_argument("--timeout", type=int, default=int(os.getenv("DIST_TIMEOUT", "120")), help="Init timeout seconds.")
+    parser.add_argument("--timeout", type=int, default=int(os.getenv("DIST_TIMEOUT", "20")), help="Init timeout seconds.")
     parser.add_argument("--device", default=os.getenv("DIST_DEVICE", "cuda"), help="cpu or cuda.")
     parser.add_argument("--user", default=os.getenv("SSH_USER"), help="SSH user (optional).")
     parser.add_argument("--identity-file", default=os.getenv("SSH_IDENTITY_FILE"), help="SSH identity file (optional).")
     parser.add_argument("--ssh-port", type=int, default=int(os.getenv("SSH_PORT", "22")), help="SSH port.")
+    parser.add_argument(
+        "--extra-env",
+        action="append",
+        default=[],
+        help="Extra env vars to pass to workers (repeatable), format KEY=VALUE.",
+    )
     args = parser.parse_args()
 
     if args.worker:
