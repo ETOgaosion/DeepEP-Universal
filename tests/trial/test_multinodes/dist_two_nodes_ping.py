@@ -6,6 +6,7 @@ import shlex
 import sys
 import datetime
 from pathlib import Path
+import inspect
 
 import torch
 import torch.distributed as dist
@@ -33,6 +34,13 @@ def _build_env_exports(env_items):
             continue
         parts.append(f"{key}={shlex.quote(str(value))}")
     return " ".join(parts)
+
+def _filter_kwargs(func, kwargs):
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
 def _parse_kv(items):
     if not items:
@@ -130,8 +138,8 @@ def _run_controller(args):
         client_kwargs["pkey"] = args.identity_file
     if args.ssh_port:
         client_kwargs["port"] = args.ssh_port
-    if args.pssh_timeout:
-        client_kwargs["timeout"] = args.pssh_timeout
+    if args.timeout:
+        client_kwargs["timeout"] = args.timeout
 
     python_bin = os.getenv("PYTHON") or "python"
     conda_sh = os.getenv("CONDA_SH", "$HOME/miniconda3/etc/profile.d/conda.sh")
@@ -181,16 +189,15 @@ def _run_controller(args):
         "host_args": [{"cmd": cmd} for cmd in commands],
         "stop_on_errors": False,
     }
-    if args.pssh_timeout:
-        run_kwargs["timeout"] = args.pssh_timeout
-    if args.pssh_read_timeout:
-        run_kwargs["read_timeout"] = args.pssh_read_timeout
-    if args.pssh_channel_timeout:
-        run_kwargs["channel_timeout"] = args.pssh_channel_timeout
+    if args.timeout:
+        run_kwargs["read_timeout"] = args.timeout
+        run_kwargs["channel_timeout"] = args.timeout
 
+    run_kwargs = _filter_kwargs(client.run_command, run_kwargs)
     output = client.run_command("%(cmd)s", **run_kwargs)
 
-    join_kwargs = {"timeout": args.pssh_join_timeout} if args.pssh_join_timeout else {}
+    join_kwargs = {"timeout": args.timeout} if args.timeout else {}
+    join_kwargs = _filter_kwargs(client.join, join_kwargs)
     client.join(output, **join_kwargs)
 
     exit_code = 0
@@ -228,15 +235,16 @@ def main():
     )
     parser.add_argument("--master-addr", default=os.getenv("MASTER_ADDR", ""), help="Master address.")
     parser.add_argument("--master-port", default=os.getenv("MASTER_PORT", "29500"), help="Master port.")
-    parser.add_argument("--timeout", type=int, default=int(os.getenv("DIST_TIMEOUT", "20")), help="Init timeout seconds.")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.getenv("DIST_TIMEOUT", "20")),
+        help="Timeout seconds used for torch.distributed and parallel-ssh.",
+    )
     parser.add_argument("--device", default=os.getenv("DIST_DEVICE", "cuda"), help="cpu or cuda.")
     parser.add_argument("--user", default=os.getenv("SSH_USER"), help="SSH user (optional).")
     parser.add_argument("--identity-file", default=os.getenv("SSH_IDENTITY_FILE"), help="SSH identity file (optional).")
     parser.add_argument("--ssh-port", type=int, default=int(os.getenv("SSH_PORT", "22")), help="SSH port.")
-    parser.add_argument("--pssh-timeout", type=int, default=int(os.getenv("PSSH_TIMEOUT", "20")), help="SSH timeout seconds (default: 20).")
-    parser.add_argument("--pssh-read-timeout", type=int, default=int(os.getenv("PSSH_READ_TIMEOUT", "20")), help="SSH read timeout seconds (default: 20).")
-    parser.add_argument("--pssh-channel-timeout", type=int, default=int(os.getenv("PSSH_CHANNEL_TIMEOUT", "20")), help="SSH channel timeout seconds (default: 20).")
-    parser.add_argument("--pssh-join-timeout", type=int, default=int(os.getenv("PSSH_JOIN_TIMEOUT", "20")), help="Join timeout seconds (default: 20).")
     parser.add_argument(
         "--extra-env",
         action="append",
