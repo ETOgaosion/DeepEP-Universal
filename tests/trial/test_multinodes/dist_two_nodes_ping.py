@@ -69,6 +69,11 @@ def _run_worker(args):
         log_fp.flush()
 
     _log(f"[rank {args.rank}] logging to {log_path}")
+    _log(
+        f"[rank {args.rank}] env RANK={os.getenv('RANK')} "
+        f"WORLD_SIZE={os.getenv('WORLD_SIZE')} "
+        f"LOCAL_RANK={os.getenv('LOCAL_RANK')}"
+    )
 
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = str(args.master_port)
@@ -91,6 +96,15 @@ def _run_worker(args):
 
     try:
         device = torch.device(args.device)
+        if device.type == "cuda":
+            local_rank = args.local_rank
+            if local_rank is None or local_rank < 0:
+                local_rank_env = os.getenv("LOCAL_RANK")
+                if local_rank_env is not None:
+                    local_rank = int(local_rank_env)
+            if local_rank is not None and local_rank >= 0:
+                torch.cuda.set_device(local_rank)
+                device = torch.device("cuda", local_rank)
         if device.type == "cuda" and not torch.cuda.is_available():
             _log(f"[rank {args.rank}] cuda requested but not available")
             return 3
@@ -236,6 +250,14 @@ def main():
     parser.add_argument("--worker", action="store_true", help="Run as worker (do not launch parallel-ssh).")
     parser.add_argument("--backend", default=os.getenv("DIST_BACKEND", "nccl"), help="Process group backend.")
     parser.add_argument("--rank", type=int, default=int(os.getenv("RANK", "-1")), help="Global rank.")
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        dest="local_rank",
+        type=int,
+        default=int(os.getenv("LOCAL_RANK", "-1")),
+        help="Local rank (torchrun).",
+    )
     parser.add_argument("--world-size", type=int, default=int(os.getenv("WORLD_SIZE", "-1")), help="World size.")
     parser.add_argument("--nnodes", type=int, default=int(os.getenv("NNODES", "0")), help="Number of nodes.")
     parser.add_argument(
