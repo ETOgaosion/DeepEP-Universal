@@ -72,8 +72,31 @@ def _run_worker(args):
     _log(
         f"[rank {args.rank}] env RANK={os.getenv('RANK')} "
         f"WORLD_SIZE={os.getenv('WORLD_SIZE')} "
-        f"LOCAL_RANK={os.getenv('LOCAL_RANK')}"
+        f"LOCAL_RANK={os.getenv('LOCAL_RANK')} "
+        f"NNODES={os.getenv('NNODES')} "
+        f"NPROC_PER_NODE={os.getenv('NPROC_PER_NODE')}"
     )
+    try:
+        resolved = socket.gethostbyname(args.master_addr)
+        _log(f"[rank {args.rank}] master_addr={args.master_addr} resolved={resolved}")
+        if resolved.startswith("127."):
+            _log(f"[rank {args.rank}] WARNING: master_addr resolves to loopback")
+    except Exception as exc:
+        _log(f"[rank {args.rank}] WARNING: failed to resolve master_addr: {exc}")
+
+    try:
+        nnodes_env = int(os.getenv("NNODES", "0"))
+        nproc_env = int(os.getenv("NPROC_PER_NODE", "0"))
+        if nnodes_env > 0 and nproc_env > 0:
+            expected_world = nnodes_env * nproc_env
+            if args.world_size != expected_world:
+                _log(
+                    f"[rank {args.rank}] ERROR: WORLD_SIZE={args.world_size} "
+                    f"!= NNODES*NPROC_PER_NODE ({nnodes_env}*{nproc_env}={expected_world})"
+                )
+                return 5
+    except Exception as exc:
+        _log(f"[rank {args.rank}] WARNING: failed to validate world size: {exc}")
 
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = str(args.master_port)
