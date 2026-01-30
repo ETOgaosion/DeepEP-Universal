@@ -7,6 +7,7 @@ import sys
 import datetime
 from pathlib import Path
 import inspect
+import socket
 
 import torch
 import torch.distributed as dist
@@ -35,6 +36,19 @@ def _build_env_exports(env_items):
         parts.append(f"{key}={shlex.quote(str(value))}")
     return " ".join(parts)
 
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
 def _filter_kwargs(func, kwargs):
     try:
         sig = inspect.signature(func)
@@ -57,6 +71,17 @@ def _parse_kv(items):
 
 
 def _run_worker(args):
+    log_fp = None
+    if args.log_dir:
+        log_dir = Path(args.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        hostname = socket.gethostname()
+        log_path = log_dir / f"dist_two_nodes_ping_rank{args.rank}_{hostname}.log"
+        log_fp = log_path.open("a", buffering=1, encoding="utf-8")
+        sys.stdout = _Tee(sys.stdout, log_fp)
+        sys.stderr = _Tee(sys.stderr, log_fp)
+        print(f"[rank {args.rank}] logging to {log_path}")
+
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = str(args.master_port)
 
@@ -91,6 +116,8 @@ def _run_worker(args):
         print(f"[rank {args.rank}] all_reduce result={tensor}")
     finally:
         dist.destroy_process_group()
+        if log_fp is not None:
+            log_fp.close()
 
     return 0
 
@@ -157,6 +184,8 @@ def _run_controller(args):
             "DIST_BACKEND": args.backend,
             "DIST_TIMEOUT": args.timeout,
             "DIST_DEVICE": args.device,
+            "LOG_DIR": args.log_dir,
+            "PYTHONUNBUFFERED": "1",
         }
         env_items = {**env_items, **extra_env}
         env_prefix = _build_env_exports(env_items)
@@ -229,10 +258,15 @@ def main():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=int(os.getenv("DIST_TIMEOUT", "20")),
+        default=int(os.getenv("DIST_TIMEOUT", "40")),
         help="Timeout seconds used for torch.distributed and parallel-ssh.",
     )
     parser.add_argument("--device", default=os.getenv("DIST_DEVICE", "cuda"), help="cpu or cuda.")
+    parser.add_argument(
+        "--log-dir",
+        default=os.getenv("LOG_DIR", "tests/trial/logs"),
+        help="Directory for per-rank logs (empty to disable).",
+    )
     parser.add_argument("--user", default=os.getenv("SSH_USER"), help="SSH user (optional).")
     parser.add_argument("--identity-file", default=os.getenv("SSH_IDENTITY_FILE"), help="SSH identity file (optional).")
     parser.add_argument("--ssh-port", type=int, default=int(os.getenv("SSH_PORT", "22")), help="SSH port.")
