@@ -130,6 +130,8 @@ def _run_controller(args):
         client_kwargs["pkey"] = args.identity_file
     if args.ssh_port:
         client_kwargs["port"] = args.ssh_port
+    if args.pssh_timeout:
+        client_kwargs["timeout"] = args.pssh_timeout
 
     python_bin = os.getenv("PYTHON") or "python"
     conda_sh = os.getenv("CONDA_SH", "$HOME/miniconda3/etc/profile.d/conda.sh")
@@ -175,12 +177,21 @@ def _run_controller(args):
     for host, cmd in zip(hosts, commands):
         print(f"[{host}] cmd: {cmd}")
 
-    output = client.run_command(
-        "%(cmd)s",
-        host_args=[{"cmd": cmd} for cmd in commands],
-        stop_on_errors=False,
-    )
-    client.join(output)
+    run_kwargs = {
+        "host_args": [{"cmd": cmd} for cmd in commands],
+        "stop_on_errors": False,
+    }
+    if args.pssh_timeout:
+        run_kwargs["timeout"] = args.pssh_timeout
+    if args.pssh_read_timeout:
+        run_kwargs["read_timeout"] = args.pssh_read_timeout
+    if args.pssh_channel_timeout:
+        run_kwargs["channel_timeout"] = args.pssh_channel_timeout
+
+    output = client.run_command("%(cmd)s", **run_kwargs)
+
+    join_kwargs = {"timeout": args.pssh_join_timeout} if args.pssh_join_timeout else {}
+    client.join(output, **join_kwargs)
 
     exit_code = 0
     for host, host_output in zip(hosts, output):
@@ -222,6 +233,10 @@ def main():
     parser.add_argument("--user", default=os.getenv("SSH_USER"), help="SSH user (optional).")
     parser.add_argument("--identity-file", default=os.getenv("SSH_IDENTITY_FILE"), help="SSH identity file (optional).")
     parser.add_argument("--ssh-port", type=int, default=int(os.getenv("SSH_PORT", "22")), help="SSH port.")
+    parser.add_argument("--pssh-timeout", type=int, default=int(os.getenv("PSSH_TIMEOUT", "20")), help="SSH timeout seconds (default: 20).")
+    parser.add_argument("--pssh-read-timeout", type=int, default=int(os.getenv("PSSH_READ_TIMEOUT", "20")), help="SSH read timeout seconds (default: 20).")
+    parser.add_argument("--pssh-channel-timeout", type=int, default=int(os.getenv("PSSH_CHANNEL_TIMEOUT", "20")), help="SSH channel timeout seconds (default: 20).")
+    parser.add_argument("--pssh-join-timeout", type=int, default=int(os.getenv("PSSH_JOIN_TIMEOUT", "20")), help="Join timeout seconds (default: 20).")
     parser.add_argument(
         "--extra-env",
         action="append",
