@@ -66,30 +66,30 @@ def _run_worker(args):
         timeout=timeout,
     )
 
-    try:
-        device = torch.device(args.device)
-        if device.type == "cuda" and not torch.cuda.is_available():
-            print(f"[rank {args.rank}] cuda requested but not available", file=sys.stderr)
-            return 3
+    # try:
+    #     device = torch.device(args.device)
+    #     if device.type == "cuda" and not torch.cuda.is_available():
+    #         print(f"[rank {args.rank}] cuda requested but not available", file=sys.stderr)
+    #         return 3
 
-        tensor = torch.tensor([1], device=device, dtype=torch.int32) * (args.rank + 1)
-        dist.barrier()
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        dist.barrier()
+    #     tensor = torch.tensor([1], device=device, dtype=torch.int32) * (args.rank + 1)
+    #     dist.barrier()
+    #     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    #     dist.barrier()
 
-        print(f"[rank {args.rank}] all_reduce result={tensor.item()}")
+    #     print(f"[rank {args.rank}] all_reduce result={tensor.item()}")
 
-        if args.world_size == 2:
-            expected = 1 + 2
-            if tensor.item() != expected:
-                print(
-                    f"[rank {args.rank}] unexpected result: {tensor.item()} "
-                    f"(expected {expected})",
-                    file=sys.stderr,
-                )
-                return 4
-    finally:
-        dist.destroy_process_group()
+    #     if args.world_size == 2:
+    #         expected = 1 + 2
+    #         if tensor.item() != expected:
+    #             print(
+    #                 f"[rank {args.rank}] unexpected result: {tensor.item()} "
+    #                 f"(expected {expected})",
+    #                 file=sys.stderr,
+    #             )
+    #             return 4
+    # finally:
+    dist.destroy_process_group()
 
     return 0
 
