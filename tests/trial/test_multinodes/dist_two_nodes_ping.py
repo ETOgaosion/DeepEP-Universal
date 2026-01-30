@@ -103,39 +103,50 @@ def _run_worker(args):
 
     timeout = datetime.timedelta(seconds=args.timeout)
 
+    device = torch.device(args.device)
+    local_rank = None
+    if device.type == "cuda":
+        local_rank = args.local_rank
+        if local_rank is None or local_rank < 0:
+            if args.nproc_per_node and args.nproc_per_node > 0:
+                local_rank = args.rank % args.nproc_per_node
+            else:
+                local_rank_env = os.getenv("LOCAL_RANK")
+                if local_rank_env is not None:
+                    local_rank = int(local_rank_env)
+        if local_rank is not None and local_rank >= 0:
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        _log(f"[rank {args.rank}] using cuda device {device}")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        _log(f"[rank {args.rank}] cuda requested but not available")
+        return 3
+
     _log(
         f"[rank {args.rank}] init_process_group backend={args.backend} "
         f"master={args.master_addr}:{args.master_port} world_size={args.world_size}"
     )
 
-    dist.init_process_group(
+    init_kwargs = dict(
         backend=args.backend,
         rank=args.rank,
         world_size=args.world_size,
         timeout=timeout,
     )
+    if device.type == "cuda" and local_rank is not None and local_rank >= 0:
+        try:
+            sig = inspect.signature(dist.init_process_group)
+            if "device_id" in sig.parameters:
+                init_kwargs["device_id"] = local_rank
+        except (TypeError, ValueError):
+            pass
+    
+    _log(f"[rank {args.rank}] init_process_group kwargs: {init_kwargs}")
+    dist.init_process_group(**init_kwargs)
     
     _log(f"[rank {args.rank}] init_process_group complete")
 
     try:
-        device = torch.device(args.device)
-        if device.type == "cuda":
-            local_rank = args.local_rank
-            if local_rank is None or local_rank < 0:
-                if args.nproc_per_node and args.nproc_per_node > 0:
-                    local_rank = args.rank % args.nproc_per_node
-                else:
-                    local_rank_env = os.getenv("LOCAL_RANK")
-                    if local_rank_env is not None:
-                        local_rank = int(local_rank_env)
-            if local_rank is not None and local_rank >= 0:
-                torch.cuda.set_device(local_rank)
-                device = torch.device("cuda", local_rank)
-            _log(f"[rank {args.rank}] using cuda device {device}")
-        if device.type == "cuda" and not torch.cuda.is_available():
-            _log(f"[rank {args.rank}] cuda requested but not available")
-            return 3
-
         tensor = torch.arange(2, device=device, dtype=torch.int64) + 1 + args.world_size * args.rank
         _log(f"[rank {args.rank}] initial tensor={tensor}")
         dist.barrier()
