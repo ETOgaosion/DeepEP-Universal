@@ -122,12 +122,16 @@ def _run_worker(args):
         if device.type == "cuda":
             local_rank = args.local_rank
             if local_rank is None or local_rank < 0:
-                local_rank_env = os.getenv("LOCAL_RANK")
-                if local_rank_env is not None:
-                    local_rank = int(local_rank_env)
+                if args.nnodes and args.nnodes > 0:
+                    local_rank = args.rank % args.nnodes
+                else:
+                    local_rank_env = os.getenv("LOCAL_RANK")
+                    if local_rank_env is not None:
+                        local_rank = int(local_rank_env)
             if local_rank is not None and local_rank >= 0:
                 torch.cuda.set_device(local_rank)
                 device = torch.device("cuda", local_rank)
+            _log(f"[rank {args.rank}] using cuda device {device}")
         if device.type == "cuda" and not torch.cuda.is_available():
             _log(f"[rank {args.rank}] cuda requested but not available")
             return 3
