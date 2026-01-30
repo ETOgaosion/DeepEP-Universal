@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import datetime
+import inspect
 import json
 import os
 import shlex
-import sys
-import datetime
-from pathlib import Path
-import inspect
 import socket
+import sys
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -19,12 +19,13 @@ except Exception as exc:  # pragma: no cover - runtime dependency
         "parallel-ssh is required. Install with: pip install parallel-ssh"
     ) from exc
 
+DEFAULT_LOG_DIR = "tests/trial/logs"
+
 
 def _load_env_config(repo_root: Path):
     env_path = repo_root / ".secrets" / "env.json"
     if not env_path.exists():
         raise SystemExit(f"Missing env config: {env_path}")
-
     return json.loads(env_path.read_text(encoding="utf-8"))
 
 
@@ -36,12 +37,14 @@ def _build_env_exports(env_items):
         parts.append(f"{key}={shlex.quote(str(value))}")
     return " ".join(parts)
 
+
 def _filter_kwargs(func, kwargs):
     try:
         sig = inspect.signature(func)
     except (TypeError, ValueError):
         return kwargs
     return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
 
 def _parse_kv(items):
     if not items:
@@ -57,76 +60,98 @@ def _parse_kv(items):
     return result
 
 
-def _run_worker(args):
-    log_dir = Path(args.log_dir or "tests/trial/logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
+def _make_logger(log_dir, rank):
     hostname = socket.gethostname()
-    log_path = log_dir / f"dist_two_nodes_ping_rank{args.rank}_{hostname}.log"
-    log_fp = log_path.open("a", buffering=1, encoding="utf-8")
+    if log_dir:
+        log_dir_path = Path(log_dir)
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir_path / f"dist_two_nodes_ping_rank{rank}_{hostname}.log"
+        log_fp = log_path.open("a", buffering=1, encoding="utf-8")
+
+        def _log(msg):
+            log_fp.write(msg + "\n")
+            log_fp.flush()
+
+        def _close():
+            log_fp.close()
+
+        return _log, _close, log_path
 
     def _log(msg):
-        log_fp.write(msg + "\n")
-        log_fp.flush()
+        print(msg, file=sys.stderr)
 
-    _log(f"[rank {args.rank}] logging to {log_path}")
-    _log(
+    def _close():
+        return
+
+    return _log, _close, "stderr"
+
+
+def _log_env(args, log):
+    log(
         f"[rank {args.rank}] env RANK={os.getenv('RANK')} "
         f"WORLD_SIZE={os.getenv('WORLD_SIZE')} "
         f"LOCAL_RANK={os.getenv('LOCAL_RANK')} "
         f"NNODES={os.getenv('NNODES')} "
         f"NPROC_PER_NODE={os.getenv('NPROC_PER_NODE')}"
     )
+
+
+def _log_master_resolution(args, log):
     try:
         resolved = socket.gethostbyname(args.master_addr)
-        _log(f"[rank {args.rank}] master_addr={args.master_addr} resolved={resolved}")
+        log(f"[rank {args.rank}] master_addr={args.master_addr} resolved={resolved}")
         if resolved.startswith("127."):
-            _log(f"[rank {args.rank}] WARNING: master_addr resolves to loopback")
+            log(f"[rank {args.rank}] WARNING: master_addr resolves to loopback")
     except Exception as exc:
-        _log(f"[rank {args.rank}] WARNING: failed to resolve master_addr: {exc}")
+        log(f"[rank {args.rank}] WARNING: failed to resolve master_addr: {exc}")
 
+
+def _validate_world_size(args, log):
     try:
         nnodes_env = int(os.getenv("NNODES", "0"))
         nproc_env = int(os.getenv("NPROC_PER_NODE", "0"))
         if nnodes_env > 0 and nproc_env > 0:
             expected_world = nnodes_env * nproc_env
             if args.world_size != expected_world:
-                _log(
+                log(
                     f"[rank {args.rank}] ERROR: WORLD_SIZE={args.world_size} "
                     f"!= NNODES*NPROC_PER_NODE ({nnodes_env}*{nproc_env}={expected_world})"
                 )
                 return 5
     except Exception as exc:
-        _log(f"[rank {args.rank}] WARNING: failed to validate world size: {exc}")
+        log(f"[rank {args.rank}] WARNING: failed to validate world size: {exc}")
+    return 0
 
-    os.environ["MASTER_ADDR"] = args.master_addr
-    os.environ["MASTER_PORT"] = str(args.master_port)
 
-    timeout = datetime.timedelta(seconds=args.timeout)
+def _resolve_local_rank(args):
+    if args.local_rank is not None and args.local_rank >= 0:
+        return args.local_rank
+    if args.nproc_per_node and args.nproc_per_node > 0:
+        return args.rank % args.nproc_per_node
+    local_rank_env = os.getenv("LOCAL_RANK")
+    if local_rank_env is not None:
+        return int(local_rank_env)
+    return None
 
+
+def _select_device(args, log):
     device = torch.device(args.device)
     local_rank = None
-    if device.type == "cuda":
-        local_rank = args.local_rank
-        if local_rank is None or local_rank < 0:
-            if args.nproc_per_node and args.nproc_per_node > 0:
-                local_rank = args.rank % args.nproc_per_node
-            else:
-                local_rank_env = os.getenv("LOCAL_RANK")
-                if local_rank_env is not None:
-                    local_rank = int(local_rank_env)
-        if local_rank is not None and local_rank >= 0:
-            torch.cuda.set_device(local_rank)
-            device = torch.device("cuda", local_rank)
-        _log(f"[rank {args.rank}] using cuda device {device}")
-    if device.type == "cuda" and not torch.cuda.is_available():
-        _log(f"[rank {args.rank}] cuda requested but not available")
-        return 3
+    if device.type != "cuda":
+        return device, local_rank, 0
+    if not torch.cuda.is_available():
+        log(f"[rank {args.rank}] cuda requested but not available")
+        return device, local_rank, 3
 
-    _log(
-        f"[rank {args.rank}] init_process_group backend={args.backend} "
-        f"master={args.master_addr}:{args.master_port} world_size={args.world_size}"
-    )
+    local_rank = _resolve_local_rank(args)
+    if local_rank is not None and local_rank >= 0:
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    log(f"[rank {args.rank}] using cuda device {device}")
+    return device, local_rank, 0
 
+
+def _build_init_kwargs(args, timeout, device, local_rank):
     init_kwargs = dict(
         backend=args.backend,
         rank=args.rank,
@@ -140,35 +165,75 @@ def _run_worker(args):
                 init_kwargs["device_id"] = local_rank
         except (TypeError, ValueError):
             pass
-    
-    _log(f"[rank {args.rank}] init_process_group kwargs: {init_kwargs}")
-    dist.init_process_group(**init_kwargs)
-    
-    _log(f"[rank {args.rank}] init_process_group complete")
+    return init_kwargs
 
+
+def _run_worker(args):
+    log_dir = args.log_dir
+    if isinstance(log_dir, str):
+        log_dir = log_dir.strip()
+    if not log_dir:
+        log_dir = None
+
+    log, close_log, log_path = _make_logger(log_dir, args.rank)
+    log(f"[rank {args.rank}] logging to {log_path}")
+    _log_env(args, log)
+    _log_master_resolution(args, log)
+
+    status = _validate_world_size(args, log)
+    if status:
+        close_log()
+        return status
+
+    os.environ["MASTER_ADDR"] = args.master_addr
+    os.environ["MASTER_PORT"] = str(args.master_port)
+
+    timeout = datetime.timedelta(seconds=args.timeout)
+    device, local_rank, status = _select_device(args, log)
+    if status:
+        close_log()
+        return status
+
+    log(
+        f"[rank {args.rank}] init_process_group backend={args.backend} "
+        f"master={args.master_addr}:{args.master_port} world_size={args.world_size}"
+    )
+    init_kwargs = _build_init_kwargs(args, timeout, device, local_rank)
+
+    pg_initialized = False
     try:
-        tensor = torch.arange(2, device=device, dtype=torch.int64) + 1 + args.world_size * args.rank
-        _log(f"[rank {args.rank}] initial tensor={tensor}")
-        dist.barrier()
-        _log(f"[rank {args.rank}] passed barrier")
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        _log(f"[rank {args.rank}] all_reduce complete")
-        dist.barrier()
+        dist.init_process_group(**init_kwargs)
+        pg_initialized = True
+        log(f"[rank {args.rank}] init_process_group complete")
 
-        _log(f"[rank {args.rank}] all_reduce result={tensor}")
+        tensor = torch.arange(2, device=device, dtype=torch.int64) + 1 + args.world_size * args.rank
+        log(f"[rank {args.rank}] initial tensor={tensor}")
+        dist.barrier()
+        log(f"[rank {args.rank}] passed barrier")
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        log(f"[rank {args.rank}] all_reduce complete")
+        dist.barrier()
+        log(f"[rank {args.rank}] all_reduce result={tensor}")
     finally:
-        dist.destroy_process_group()
-        log_fp.close()
-        if log_fp is not None:
-            log_fp.close()
+        if pg_initialized:
+            dist.destroy_process_group()
+        close_log()
 
     return 0
 
 
-def _run_controller(args):
-    repo_root = Path(__file__).resolve().parents[3]
-    cfg = _load_env_config(repo_root)
+def _collect_extra_env(cfg, args):
+    extra_env = {}
+    if isinstance(cfg.get("EXTRA_ENVS"), dict):
+        extra_env.update(cfg.get("EXTRA_ENVS"))
+    test_envs = cfg.get("TEST_ENVS", {})
+    if isinstance(test_envs, dict) and isinstance(test_envs.get("dist_two_nodes_ping"), dict):
+        extra_env.update(test_envs.get("dist_two_nodes_ping"))
+    extra_env.update(_parse_kv(args.extra_env))
+    return extra_env
 
+
+def _resolve_hosts(cfg):
     ssh_master_addr = cfg.get("SSH_MASTER_NODE_ADDR") or cfg.get("MASTER_NODE_ADDR")
     ssh_slave_addrs = list(cfg.get("SSH_SLAVE_NODE_ADDRS", [])) or list(cfg.get("SLAVE_NODE_ADDRS", []))
     master_addr = cfg.get("MASTER_NODE_IP")
@@ -178,16 +243,51 @@ def _run_controller(args):
         raise SystemExit("SSH_SLAVE_NODE_ADDRS (or SLAVE_NODE_ADDRS) is empty in .secrets/env.json")
     if not master_addr:
         raise SystemExit("MASTER_NODE_IP is missing in .secrets/env.json")
-
     hosts = [ssh_master_addr] + ssh_slave_addrs
+    return hosts, master_addr
+
+
+def _build_worker_command(
+    repo_root,
+    python_bin,
+    conda_sh,
+    conda_env,
+    env_sh_cmd,
+    env_items,
+    args,
+    nnodes,
+    nproc_per_node,
+    node_rank,
+    master_addr,
+):
+    env_prefix = _build_env_exports(env_items)
+    return (
+        f"cd {shlex.quote(str(repo_root))} && "
+        f"source {conda_sh} && conda activate {shlex.quote(conda_env)} && "
+        f"{env_sh_cmd}"
+        f"{env_prefix} {shlex.quote(python_bin)} -m torch.distributed.run "
+        f"--nnodes {nnodes} --nproc_per_node {nproc_per_node} "
+        f"--node_rank {node_rank} "
+        f"--master_addr {shlex.quote(master_addr)} --master_port {shlex.quote(str(args.master_port))} "
+        f"tests/trial/test_multinodes/dist_two_nodes_ping.py --worker"
+    ).strip()
+
+
+def _run_controller(args):
+    repo_root = Path(__file__).resolve().parents[3]
+    cfg = _load_env_config(repo_root)
+
+    hosts, master_addr = _resolve_hosts(cfg)
     nnodes = args.nnodes or len(hosts)
     if nnodes != len(hosts):
         raise SystemExit(
             f"--nnodes ({nnodes}) does not match host list length ({len(hosts)})."
         )
+
     nproc_per_node = args.nproc_per_node
     if nproc_per_node <= 0:
         raise SystemExit("--nproc-per-node is required and must be > 0.")
+
     world_size = args.world_size if args.world_size > 0 else nnodes * nproc_per_node
     if args.world_size > 0 and world_size != nnodes * nproc_per_node:
         raise SystemExit(
@@ -211,13 +311,8 @@ def _run_controller(args):
     env_sh = os.getenv("ENV_SH", "")
     env_sh_cmd = f"source {shlex.quote(env_sh)} && " if env_sh else ""
 
-    extra_env = {}
-    if isinstance(cfg.get("EXTRA_ENVS"), dict):
-        extra_env.update(cfg.get("EXTRA_ENVS"))
-    test_envs = cfg.get("TEST_ENVS", {})
-    if isinstance(test_envs, dict) and isinstance(test_envs.get("dist_two_nodes_ping"), dict):
-        extra_env.update(test_envs.get("dist_two_nodes_ping"))
-    extra_env.update(_parse_kv(args.extra_env))
+    extra_env = _collect_extra_env(cfg, args)
+
     commands = []
     for node_rank, host in enumerate(hosts):
         env_items = {
@@ -234,23 +329,23 @@ def _run_controller(args):
             "PYTHONUNBUFFERED": "1",
         }
         env_items = {**env_items, **extra_env}
-        env_prefix = _build_env_exports(env_items)
-        cmd = (
-            f"cd {shlex.quote(str(repo_root))} && "
-            f"source {conda_sh} && conda activate {shlex.quote(conda_env)} && "
-            f"{env_sh_cmd}"
-            f"{env_prefix} {shlex.quote(python_bin)} -m torch.distributed.run "
-            f"--nnodes {nnodes} --nproc_per_node {nproc_per_node} "
-            f"--node_rank {node_rank} "
-            f"--master_addr {shlex.quote(master_addr)} --master_port {shlex.quote(str(args.master_port))} "
-            f"tests/trial/test_multinodes/dist_two_nodes_ping.py --worker"
-        ).strip()
+        cmd = _build_worker_command(
+            repo_root,
+            python_bin,
+            conda_sh,
+            conda_env,
+            env_sh_cmd,
+            env_items,
+            args,
+            nnodes,
+            nproc_per_node,
+            node_rank,
+            master_addr,
+        )
         commands.append(cmd)
-
-    client = ParallelSSHClient(hosts, **client_kwargs)
-    for host, cmd in zip(hosts, commands):
         print(f"[{host}] cmd: {cmd}")
 
+    client = ParallelSSHClient(hosts, **client_kwargs)
     run_kwargs = {
         "host_args": [{"cmd": cmd} for cmd in commands],
         "stop_on_errors": False,
@@ -318,7 +413,7 @@ def main():
     parser.add_argument("--device", default=os.getenv("DIST_DEVICE", "cuda"), help="cpu or cuda.")
     parser.add_argument(
         "--log-dir",
-        default=os.getenv("LOG_DIR", "tests/trial/logs"),
+        default=os.getenv("LOG_DIR", DEFAULT_LOG_DIR),
         help="Directory for per-rank logs (empty to disable).",
     )
     parser.add_argument("--user", default=os.getenv("SSH_USER"), help="SSH user (optional).")
