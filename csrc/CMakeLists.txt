@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.10)
 project(deep_ep LANGUAGES CUDA CXX)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
+set(DISABLE_IBGDA ON CACHE BOOL "Disable IBGDA and low-latency internode kernels" FORCE)
+
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -fPIC")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fPIC")
 set(CUDA_SEPARABLE_COMPILATION ON)
@@ -25,6 +27,10 @@ add_library(nvshmem_device ALIAS nvshmem::nvshmem_device)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
+
+if (DISABLE_IBGDA)
+    add_compile_definitions(DISABLE_IBGDA)
+endif()
 
 include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS} ${NVSHMEM_INCLUDE_DIR})
 link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib ${NVSHMEM_LIB_DIR})

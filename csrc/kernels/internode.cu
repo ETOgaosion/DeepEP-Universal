@@ -4,7 +4,6 @@
 #include "buffer.cuh"
 #include "configs.cuh"
 #include "exception.cuh"
-#include "ibgda_device.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
 
@@ -89,6 +88,19 @@ __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const nvshmem_tea
     kLowLatencyMode ? void(nvshmem_sync(rdma_team)) : nvshmem_sync_all();
 }
 
+__forceinline__ __device__ void nvshmem_put_nbi_lane0(void* dst, const void* src, size_t bytes, int pe, int lane_id) {
+    if (lane_id == 0)
+        nvshmem_putmem_nbi(dst, src, bytes, pe);
+}
+
+__forceinline__ __device__ void nvshmem_atomic_add_u64(uint64_t* dst, int value, int pe, bool is_local) {
+    if (is_local) {
+        atomicAdd(reinterpret_cast<unsigned long long*>(dst), static_cast<unsigned long long>(value));
+    } else {
+        nvshmem_ulonglong_atomic_add(reinterpret_cast<unsigned long long*>(dst), static_cast<unsigned long long>(value), pe);
+    }
+}
+
 template <bool kLowLatencyMode, int kNumRDMARanks>
 __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 int* moe_recv_counter_mapped,
@@ -129,14 +141,9 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         EP_DEVICE_ASSERT(num_warps > 1);
         EP_DEVICE_ASSERT(kNumRDMARanks <= num_threads);
 
-        // waiting for all previous inflight wrs to complete,
-        // in case of rewriting cleared rdma_buffer
-        auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
-        for (int i = thread_id; i < qps_per_rdma_rank * (kNumRDMARanks - 1); i += num_threads) {
-            auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % kNumRDMARanks;
-            auto qp_id = i % qps_per_rdma_rank;
-            nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id);
-        }
+        // Ensure prior RDMA writes are visible before clearing rdma_buffer.
+        if (thread_id == 0)
+            nvshmem_quiet();
         __syncthreads();
 
         if (thread_id == 32)
@@ -170,13 +177,11 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // TODO: overlap EP barrier and NVL cleaning
         for (int i = warp_id; i < kNumRDMARanks; i += num_warps) {
             if (i != rdma_rank) {
-                nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank)),
-                                                  reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.send_buffer(i)),
-                                                  (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int),
-                                                  translate_dst_rdma_rank<kLowLatencyMode>(i, nvl_rank),
-                                                  0,
-                                                  lane_id,
-                                                  0);
+                nvshmem_put_nbi_lane0(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank),
+                                      rdma_recv_num_tokens_mixed.send_buffer(i),
+                                      (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int),
+                                      translate_dst_rdma_rank<kLowLatencyMode>(i, nvl_rank),
+                                      lane_id);
             } else {
                 UNROLLED_WARP_COPY(1,
                                    lane_id,
@@ -190,8 +195,8 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         __syncthreads();
 
         // Wait previous operations to be finished
-        if (thread_id < kNumRDMARanks and thread_id != rdma_rank)
-            nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), 0);
+        if (thread_id == 0)
+            nvshmem_quiet();
         __syncthreads();
 
         // Barrier
@@ -489,8 +494,6 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
 
-    EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
-
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
         if (is_forwarder) {
             if (warp_id < NUM_MAX_NVL_PEERS) {
@@ -609,13 +612,11 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
             // Issue RDMA for non-local ranks
             if (dst_rdma_rank != rdma_rank) {
-                nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank)),
-                                                  reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank)),
-                                                  sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
-                                                  translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
-                                                  channel_id,
-                                                  lane_id,
-                                                  0);
+                nvshmem_put_nbi_lane0(rdma_channel_meta.recv_buffer(rdma_rank),
+                                      rdma_channel_meta.send_buffer(dst_rdma_rank),
+                                      sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
+                                      translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
+                                      lane_id);
             }
         }
         sync_rdma_sender_smem();
@@ -815,13 +816,11 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_token);
                     const auto src_ptr =
                         reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + dst_slot_idx * num_bytes_per_token);
-                    nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr,
-                                                      src_ptr,
-                                                      num_bytes_per_msg,
-                                                      translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
-                                                      channel_id,
-                                                      lane_id,
-                                                      0);
+                    nvshmem_put_nbi_lane0(reinterpret_cast<void*>(dst_ptr),
+                                          reinterpret_cast<const void*>(src_ptr),
+                                          num_bytes_per_msg,
+                                          translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
+                                          lane_id);
                 } else {
                     // Lighter fence for local RDMA rank
                     memory_fence();
@@ -832,11 +831,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
-                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
-                                                    num_tokens_to_issue,
-                                                    translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
-                                                    channel_id,
-                                                    dst_rdma_rank == rdma_rank);
+                    nvshmem_atomic_add_u64(rdma_channel_tail.buffer(rdma_rank),
+                                           num_tokens_to_issue,
+                                           translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
+                                           dst_rdma_rank == rdma_rank);
                 }
                 __syncwarp();
             }
@@ -1042,11 +1040,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             // Update remote head
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and
                 lane_id < kNumRDMARanks) {
-                nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
-                                                min_head - last_head,
-                                                translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank),
-                                                channel_id + num_channels,
-                                                lane_id == rdma_rank);
+                nvshmem_atomic_add_u64(rdma_channel_head.buffer(rdma_rank),
+                                       min_head - last_head,
+                                       translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank),
+                                       lane_id == rdma_rank);
                 last_head = min_head;
             }
 
@@ -1338,12 +1335,8 @@ __global__ void cached_notify(const int rdma_clean_offset,
 
     // Using two SMs, which clean the RDMA/NVL buffer respectively
     if (sm_id == 0) {
-        auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
-        for (int i = thread_id; i < qps_per_rdma_rank * (num_rdma_ranks - 1); i += num_threads) {
-            auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % num_rdma_ranks;
-            auto qp_id = i % qps_per_rdma_rank;
-            nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id);
-        }
+        if (thread_id == 0)
+            nvshmem_quiet();
         __syncthreads();
 
         // Barrier for RDMA
@@ -2115,13 +2108,11 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                             reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_token);
                         const auto src_ptr =
                             reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_token);
-                        nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr,
-                                                          src_ptr,
-                                                          num_bytes_per_msg,
-                                                          translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
-                                                          channel_id,
-                                                          lane_id,
-                                                          0);
+                        nvshmem_put_nbi_lane0(reinterpret_cast<void*>(dst_ptr),
+                                              reinterpret_cast<const void*>(src_ptr),
+                                              num_bytes_per_msg,
+                                              translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
+                                              lane_id);
                     } else {
                         memory_fence();
                     }
@@ -2129,11 +2120,10 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                     // Write new RDMA tail
                     __syncwarp();
                     if (elect_one_sync()) {
-                        nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
-                                                        num_chunked_tokens,
-                                                        translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
-                                                        channel_id,
-                                                        dst_rdma_rank == rdma_rank);
+                        nvshmem_atomic_add_u64(rdma_channel_tail.buffer(rdma_rank),
+                                               num_chunked_tokens,
+                                               translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
+                                               dst_rdma_rank == rdma_rank);
                     }
                 }
             }
@@ -2247,11 +2237,10 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                             min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
                     if (min_head != std::numeric_limits<int>::max() and min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and
                         lane_id < kNumRDMARanks) {
-                        nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
-                                                        min_head - last_rdma_head,
-                                                        translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
-                                                        channel_id + num_channels,
-                                                        dst_rdma_rank == rdma_rank);
+                        nvshmem_atomic_add_u64(rdma_channel_head.buffer(rdma_rank),
+                                               min_head - last_rdma_head,
+                                               translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
+                                               dst_rdma_rank == rdma_rank);
                         last_rdma_head = min_head;
                     }
                 } else {

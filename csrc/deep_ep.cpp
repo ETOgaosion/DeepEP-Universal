@@ -168,6 +168,9 @@ Buffer::Buffer(int rank,
 #ifdef DISABLE_NVSHMEM
     EP_HOST_ASSERT(num_rdma_ranks == 1 and not low_latency_mode and "NVSHMEM is disabled during compilation");
 #endif
+#ifdef DISABLE_IBGDA
+    EP_HOST_ASSERT(!low_latency_mode and "IBGDA is disabled during compilation");
+#endif
 
     // Get device info
     cudaDeviceProp device_prop = {};
@@ -1356,7 +1359,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             send_nvl_head,
             event};
 #else
-    EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
+    EP_HOST_ASSERT(false and "NVSHMEM or IBGDA is disabled during compilation");
     return {};
 #endif
 }
@@ -1877,22 +1880,34 @@ bool is_sm90_compiled() {
 }
 
 void Buffer::low_latency_update_mask_buffer(int rank_to_mask, bool mask) {
+#if defined(DISABLE_NVSHMEM) || defined(DISABLE_IBGDA)
+    EP_HOST_ASSERT(false and "NVSHMEM or IBGDA is disabled during compilation");
+#else
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < num_ranks);
     internode_ll::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
+#endif
 }
 
 void Buffer::low_latency_query_mask_buffer(const torch::Tensor& mask_status) {
+#if defined(DISABLE_NVSHMEM) || defined(DISABLE_IBGDA)
+    EP_HOST_ASSERT(false and "NVSHMEM or IBGDA is disabled during compilation");
+#else
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(mask_status.numel() == num_ranks && mask_status.scalar_type() == torch::kInt32);
 
     internode_ll::query_mask_buffer(
         mask_buffer_ptr, num_ranks, reinterpret_cast<int*>(mask_status.data_ptr()), at::cuda::getCurrentCUDAStream());
+#endif
 }
 
 void Buffer::low_latency_clean_mask_buffer() {
+#if defined(DISABLE_NVSHMEM) || defined(DISABLE_IBGDA)
+    EP_HOST_ASSERT(false and "NVSHMEM or IBGDA is disabled during compilation");
+#else
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
+#endif
 }
 
 }  // namespace deep_ep

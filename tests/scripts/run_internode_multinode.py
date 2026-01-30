@@ -41,6 +41,42 @@ def _filter_kwargs(func, kwargs):
         return kwargs
     return {k: v for k, v in kwargs.items() if k in sig.parameters}
 
+def _parse_kv(items):
+    if not items:
+        return {}
+    result = {}
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"Invalid --extra-env value '{item}', expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        if not key:
+            raise SystemExit(f"Invalid --extra-env value '{item}', empty key")
+        result[key] = value
+    return result
+
+def _collect_extra_env(cfg, args):
+    extra_env = {}
+    if isinstance(cfg.get("EXTRA_ENVS"), dict):
+        extra_env.update(cfg.get("EXTRA_ENVS"))
+    test_envs = cfg.get("TEST_ENVS", {})
+    if isinstance(test_envs, dict):
+        for key in ("run_internode_multinode", "internode_multinode", "internode"):
+            if isinstance(test_envs.get(key), dict):
+                extra_env.update(test_envs.get(key))
+    extra_env.update(_parse_kv(args.extra_env))
+    return extra_env
+
+def _resolve_hosts(cfg):
+    ssh_master_addr = cfg.get("SSH_MASTER_NODE_ADDR") or cfg.get("MASTER_NODE_IP")
+    ssh_slave_addrs = list(cfg.get("SSH_SLAVE_NODE_ADDRS", [])) or list(cfg.get("SLAVE_NODE_ADDRS", []))
+    master_addr = cfg.get("MASTER_NODE_IP")
+    if not ssh_master_addr:
+        raise SystemExit("SSH_MASTER_NODE_ADDR (or MASTER_NODE_IP) is missing in .secrets/env.json")
+    if not ssh_slave_addrs:
+        raise SystemExit("SSH_SLAVE_NODE_ADDRS (or SLAVE_NODE_ADDRS) is empty in .secrets/env.json")
+    if not master_addr:
+        raise SystemExit("MASTER_NODE_IP is missing in .secrets/env.json")
+    return [ssh_master_addr] + ssh_slave_addrs, master_addr
 
 def main(argv=None):
     repo_root = Path(__file__).resolve().parents[2]
@@ -59,32 +95,34 @@ def main(argv=None):
     parser.add_argument("--preflight-cmd", default=os.getenv("PSSH_PREFLIGHT_CMD", ""), help="Optional command to run on all hosts before the test.")
     # Note: accept the same arguments as tests/functional_tests/test_internode.py
     parser.add_argument("--num-processes", type=int, default=int(os.getenv("NUM_PROCESSES", "8")))
-    parser.add_argument("--world-size", type=int, default=int(os.getenv("WORLD_SIZE", "0")))
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=int(os.getenv("WORLD_SIZE", "0")),
+        help="Number of nodes (defaults to host list length).",
+    )
     parser.add_argument("--num-tokens", type=int, default=int(os.getenv("NUM_TOKENS", "4096")))
     parser.add_argument("--hidden", type=int, default=int(os.getenv("HIDDEN", "7168")))
     parser.add_argument("--num-topk-groups", type=int, default=int(os.getenv("NUM_TOPK_GROUPS", "0")) or None)
     parser.add_argument("--num-topk", type=int, default=int(os.getenv("NUM_TOPK", "8")))
     parser.add_argument("--pressure-test-mode", type=int, default=int(os.getenv("PRESSURE_TEST_MODE", "0")))
     parser.add_argument("--num-experts", type=int, default=int(os.getenv("NUM_EXPERTS", "256")))
+    parser.add_argument(
+        "--extra-env",
+        action="append",
+        default=[],
+        help="Extra env vars to pass to workers (repeatable), format KEY=VALUE.",
+    )
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve()
     cfg = _load_env_config(repo_root)
 
-    master_addr = cfg.get("MASTER_NODE_ADDR")
-    slave_addrs = list(cfg.get("SLAVE_NODE_ADDRS", []))
-    if not master_addr:
-        raise SystemExit("MASTER_NODE_ADDR is missing in .secrets/env.json")
-    if not slave_addrs:
-        raise SystemExit("SLAVE_NODE_ADDRS is empty in .secrets/env.json")
-
-    hosts = [master_addr] + slave_addrs
-    world_size = args.world_size
-    if world_size <= 0:
-        raise SystemExit("--world-size is required and must be > 0.")
-    if world_size != len(hosts):
+    hosts, master_addr = _resolve_hosts(cfg)
+    num_nodes = args.world_size if args.world_size > 0 else len(hosts)
+    if args.world_size > 0 and num_nodes != len(hosts):
         raise SystemExit(
-            f"--world-size ({world_size}) does not match host list length ({len(hosts)})."
+            f"--world-size ({num_nodes}) does not match host list length ({len(hosts)})."
         )
 
     passthrough_env = {
@@ -97,14 +135,19 @@ def main(argv=None):
         "PRESSURE_TEST_MODE": args.pressure_test_mode,
         "NUM_EXPERTS": args.num_experts,
     }
+    extra_env = _collect_extra_env(cfg, args)
 
     def build_cmd(rank: int):
         env_items = {
             "MASTER_ADDR": master_addr,
             "MASTER_PORT": args.master_port,
-            "WORLD_SIZE": world_size,
+            "WORLD_SIZE": num_nodes,
             "RANK": rank,
+            "NNODES": num_nodes,
+            "NPROC_PER_NODE": args.num_processes,
+            "PYTHONUNBUFFERED": "1",
             **passthrough_env,
+            **extra_env,
         }
         env_prefix = _build_env_exports(env_items)
         script_args = [
@@ -143,6 +186,8 @@ def main(argv=None):
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
         print("[debug] hosts:", hosts)
+        print("[debug] master_addr:", master_addr)
+        print("[debug] num_nodes:", num_nodes)
         print("[debug] repo_root:", repo_root)
         print("[debug] pssh kwargs:", client_kwargs)
 

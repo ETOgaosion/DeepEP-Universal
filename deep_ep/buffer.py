@@ -15,7 +15,7 @@ class Buffer:
     The core expert-parallel (EP) communication buffers for Mixture of Experts (MoE) model, which supports:
         - high-throughput intranode all-to-all (dispatch and combine, using NVSHMEM)
         - high-throughput internode all-to-all (dispatch and combine, using RDMA and NVLink)
-        - low-latency all-to-all (dispatch and combine, using RDMA)
+        - low-latency all-to-all (dispatch and combine, using RDMA) when enabled in the build
 
     Attributes:
         num_sms: the SMs used in high-throughput kernels.
@@ -48,9 +48,8 @@ class Buffer:
             group: the communication group.
             num_nvl_bytes: the buffer size for intranode NVSHMEM communication.
             num_rdma_bytes: the buffer size for internode (also for intranode with low-latency mode) RDMA communication.
-            low_latency_mode: whether to enable low-latency mode.
-            num_qps_per_rank: the number of QPs for RDMA, the low-latency mode requires that this number equals
-                to the number of local experts.
+            low_latency_mode: whether to enable low-latency mode (disabled in this build).
+            num_qps_per_rank: deprecated in IBRC-only builds (ignored).
             allow_nvlink_for_low_latency_mode: whether allow NVLink traffic for low-latency mode, you should notice
                 this is somehow incompatible with the hook-based overlapping.
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
@@ -66,6 +65,8 @@ class Buffer:
         use_nvshmem_intranode = num_nvl_bytes > 0 and num_rdma_bytes == 0
         if not use_nvshmem_intranode:
             check_nvlink_connections(group)
+        if low_latency_mode:
+            raise ValueError("low_latency_mode is disabled in this build")
 
         # Initialize the CPP runtime
         if group is not None:
@@ -105,19 +106,9 @@ class Buffer:
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode or use_nvshmem_intranode:
-            # Enable IBGDA
-            assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-            if use_nvshmem_intranode and not low_latency_mode and self.runtime.get_num_rdma_ranks() == 1:
-                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '0'
-                os.environ.pop('NVSHMEM_IBGDA_NUM_RC_PER_PE', None)
-            else:
-                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-                os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
-
-            # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
-            self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
-            os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
+            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '0'
+            os.environ.pop('NVSHMEM_IBGDA_NUM_RC_PER_PE', None)
 
             # Reduce gpu memory usage
             # 6 default teams + 1 extra team
@@ -599,9 +590,7 @@ class Buffer:
                              async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
-        A low-latency implementation for dispatching with IBGDA.
-        This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
-            (specifically, IBGDA must be enabled).
+        A low-latency implementation for dispatching.
         Warning: as there are only two buffers, and the returned tensors reuse the buffer, you cannot hold more than 2
             low-latency kernels' result tensors at a single moment.
 
@@ -645,7 +634,8 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+        if not self.low_latency_mode:
+            raise RuntimeError("low_latency_mode is disabled for this buffer")
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               cumulative_local_expert_recv_stats,
@@ -666,9 +656,7 @@ class Buffer:
                             combine_wait_recv_cost_stats: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
-        A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
-        This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
-            (specifically, IBGDA must be enabled).
+        A low-latency implementation for combining tokens (reduce **with weights**).
         Warning: as there are only two buffers, and the returned tensors reuse the buffer, you cannot hold more than 2
             low-latency kernels' result tensors at a single moment.
 
@@ -699,7 +687,8 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+        if not self.low_latency_mode:
+            raise RuntimeError("low_latency_mode is disabled for this buffer")
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                                    combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
                                                                    num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
