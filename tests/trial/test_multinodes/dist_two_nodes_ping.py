@@ -65,6 +65,8 @@ def _run_worker(args):
         world_size=args.world_size,
         timeout=timeout,
     )
+    
+    print(f"[rank {args.rank}] init_process_group complete")
 
     # try:
     #     device = torch.device(args.device)
