@@ -11,6 +11,10 @@
 
 #include <cuda_fp16.h>
 
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
 namespace deep_ep {
 
 namespace intranode {
@@ -29,6 +33,11 @@ namespace intranode {
     } while (0)
 
 namespace {
+
+inline bool env_flag_enabled(const char* name) {
+    const char* val = std::getenv(name);
+    return val && std::string(val) == "1";
+}
 
 __device__ __forceinline__ int* get_raw_counts_ptr(void* base_ptr, int num_ranks) {
     (void)num_ranks;
@@ -113,7 +122,8 @@ __global__ void write_local_counts(const int* num_tokens_per_rank, const int* nu
 
 __global__ void gather_counts(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
                               const int* num_tokens_per_expert, int* moe_recv_expert_counter_mapped, int num_experts,
-                              int expert_alignment, int* rank_prefix_matrix_copy, int rank, void** buffer_ptrs) {
+                              int expert_alignment, int* rank_prefix_matrix_copy, int rank, void** buffer_ptrs,
+                              int debug_use_ptr_read) {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
 
@@ -127,7 +137,13 @@ __global__ void gather_counts(const int* num_tokens_per_rank, int* moe_recv_coun
     for (int dest = 0; dest < num_ranks; ++ dest) {
         int prefix = 0;
         for (int src = 0; src < num_ranks; ++ src) {
-            int value = nvshmem_int_g(raw_counts + dest, src);
+            int value = 0;
+            if (debug_use_ptr_read) {
+                auto* peer_raw_counts = static_cast<int*>(nvshmem_ptr(raw_counts, src));
+                value = (peer_raw_counts == nullptr) ? 0 : peer_raw_counts[dest];
+            } else {
+                value = nvshmem_int_g(raw_counts + dest, src);
+            }
             prefix += value;
             int idx = src * num_ranks + dest;
             rank_prefix_matrix_copy[idx] = prefix;
@@ -141,8 +157,14 @@ __global__ void gather_counts(const int* num_tokens_per_rank, int* moe_recv_coun
     for (int i = 0; i < num_experts_per_rank; ++ i) {
         int expert_idx = rank * num_experts_per_rank + i;
         int sum = 0;
-        for (int src = 0; src < num_ranks; ++ src)
-            sum += nvshmem_int_g(raw_expert_counts + expert_idx, src);
+        for (int src = 0; src < num_ranks; ++ src) {
+            if (debug_use_ptr_read) {
+                auto* peer_raw_expert_counts = static_cast<int*>(nvshmem_ptr(raw_expert_counts, src));
+                sum += (peer_raw_expert_counts == nullptr) ? 0 : peer_raw_expert_counts[expert_idx];
+            } else {
+                sum += nvshmem_int_g(raw_expert_counts + expert_idx, src);
+            }
+        }
         sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
         moe_recv_expert_counter_mapped[i] = sum;
     }
@@ -168,7 +190,8 @@ __global__ void dispatch_send(void** buffer_ptrs, int rank, int num_ranks, int n
                               const int64_t* topk_idx, const float* topk_weights,
                               int num_tokens, int num_topk, int num_scales,
                               int hidden_int4, int scale_token_stride, int scale_hidden_stride,
-                              int num_recv_buffer_tokens) {
+                              int num_recv_buffer_tokens,
+                              int debug_use_ptr_write) {
     int token_idx = static_cast<int>(blockIdx.x) * blockDim.x + static_cast<int>(threadIdx.x);
     if (token_idx >= num_tokens)
         return;
@@ -193,10 +216,30 @@ __global__ void dispatch_send(void** buffer_ptrs, int rank, int num_ranks, int n
 
         auto* dst_x = buffers.x + static_cast<int64_t>(slot) * hidden_int4;
         auto* src_x = x + static_cast<int64_t>(token_idx) * hidden_int4;
-        nvshmem_putmem(dst_x, src_x, static_cast<size_t>(hidden_int4) * sizeof(int4), dest);
+        if (dest == rank) {
+            for (int i = 0; i < hidden_int4; ++i)
+                dst_x[i] = src_x[i];
+        } else if (debug_use_ptr_write) {
+            auto* peer_dst_x = static_cast<int4*>(nvshmem_ptr(dst_x, dest));
+            if (peer_dst_x != nullptr) {
+                for (int i = 0; i < hidden_int4; ++i)
+                    peer_dst_x[i] = src_x[i];
+            }
+        } else {
+            nvshmem_putmem(dst_x, src_x, static_cast<size_t>(hidden_int4) * sizeof(int4), dest);
+        }
 
-        if (buffers.src_idx != nullptr)
-            nvshmem_putmem(buffers.src_idx + slot, &token_idx, sizeof(int), dest);
+        if (buffers.src_idx != nullptr) {
+            if (dest == rank) {
+                buffers.src_idx[slot] = token_idx;
+            } else if (debug_use_ptr_write) {
+                auto* peer_dst_src_idx = static_cast<int*>(nvshmem_ptr(buffers.src_idx + slot, dest));
+                if (peer_dst_src_idx != nullptr)
+                    *peer_dst_src_idx = token_idx;
+            } else {
+                nvshmem_putmem(buffers.src_idx + slot, &token_idx, sizeof(int), dest);
+            }
+        }
 
         if (num_topk > 0 && topk_idx != nullptr && topk_weights != nullptr) {
             int recv_expert_begin = dest * num_experts_per_rank;
@@ -209,21 +252,43 @@ __global__ void dispatch_send(void** buffer_ptrs, int rank, int num_ranks, int n
                     idx_value = -1;
                 }
                 float weight_value = (idx_value >= 0) ? topk_weights[token_idx * num_topk + k] : 0.0f;
-                nvshmem_putmem(buffers.topk_idx + static_cast<int64_t>(slot) * num_topk + k,
-                               &idx_value, sizeof(int64_t), dest);
-                nvshmem_putmem(buffers.topk_weights + static_cast<int64_t>(slot) * num_topk + k,
-                               &weight_value, sizeof(float), dest);
+                if (dest == rank) {
+                    buffers.topk_idx[static_cast<int64_t>(slot) * num_topk + k] = idx_value;
+                    buffers.topk_weights[static_cast<int64_t>(slot) * num_topk + k] = weight_value;
+                } else if (debug_use_ptr_write) {
+                    auto* peer_topk_idx = static_cast<int64_t*>(
+                        nvshmem_ptr(buffers.topk_idx + static_cast<int64_t>(slot) * num_topk + k, dest));
+                    auto* peer_topk_weight = static_cast<float*>(
+                        nvshmem_ptr(buffers.topk_weights + static_cast<int64_t>(slot) * num_topk + k, dest));
+                    if (peer_topk_idx != nullptr)
+                        *peer_topk_idx = idx_value;
+                    if (peer_topk_weight != nullptr)
+                        *peer_topk_weight = weight_value;
+                } else {
+                    nvshmem_putmem(buffers.topk_idx + static_cast<int64_t>(slot) * num_topk + k,
+                                   &idx_value, sizeof(int64_t), dest);
+                    nvshmem_putmem(buffers.topk_weights + static_cast<int64_t>(slot) * num_topk + k,
+                                   &weight_value, sizeof(float), dest);
+                }
             }
         }
 
         if (num_scales > 0 && x_scales != nullptr) {
-            float tmp_scales[128];
             for (int i = 0; i < num_scales; ++ i) {
                 auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                tmp_scales[i] = x_scales[offset];
+                float scale_value = x_scales[offset];
+                if (dest == rank) {
+                    buffers.x_scales[static_cast<int64_t>(slot) * num_scales + i] = scale_value;
+                } else if (debug_use_ptr_write) {
+                    auto* peer_scale = static_cast<float*>(
+                        nvshmem_ptr(buffers.x_scales + static_cast<int64_t>(slot) * num_scales + i, dest));
+                    if (peer_scale != nullptr)
+                        *peer_scale = scale_value;
+                } else {
+                    nvshmem_putmem(buffers.x_scales + static_cast<int64_t>(slot) * num_scales + i,
+                                   &scale_value, sizeof(float), dest);
+                }
             }
-            nvshmem_putmem(buffers.x_scales + static_cast<int64_t>(slot) * num_scales, tmp_scales,
-                           static_cast<size_t>(num_scales) * sizeof(float), dest);
         }
     }
 }
@@ -433,6 +498,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
     (void)num_memset_int;
     (void)barrier_signal_ptrs;
     (void)num_channels;
+    const bool debug_use_ptr_read = !env_flag_enabled("DEEPEP_DEBUG_NOTIFY_DISABLE_PTR_READ");
 
     LAUNCH_KERNEL_SIMPLE(1, 256, stream, write_local_counts,
                          num_tokens_per_rank, num_tokens_per_expert, num_ranks, num_experts, buffer_ptrs);
@@ -442,7 +508,8 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
     LAUNCH_KERNEL_SIMPLE(1, 1, stream, gather_counts,
                          num_tokens_per_rank, moe_recv_counter_mapped, num_ranks,
                          num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts,
-                         expert_alignment, rank_prefix_matrix_copy, rank, buffer_ptrs);
+                         expert_alignment, rank_prefix_matrix_copy, rank, buffer_ptrs,
+                         debug_use_ptr_read ? 1 : 0);
 
     LAUNCH_KERNEL_SIMPLE(ceil_div(num_ranks * num_channels, 256), 256, stream,
                          fill_int, channel_prefix_matrix, 0, num_ranks * num_channels);
@@ -502,31 +569,41 @@ void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* re
     (void)num_max_send_tokens;
     (void)channel_prefix_matrix;
     (void)num_worst_tokens;
+    const bool debug_use_ptr_write = !env_flag_enabled("DEEPEP_DEBUG_DISPATCH_SEND_DISABLE_PTR_WRITE");
     const int num_channels = num_sms > 0 ? num_sms / 2 : 1;
 
     LAUNCH_KERNEL_SIMPLE(1, 256, stream, clear_channel_head,
                          num_ranks, num_experts, num_channels, num_recv_buffer_tokens, hidden_int4, num_topk, num_scales,
                          buffer_ptrs);
 
-    LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens, 256), 256, stream, dispatch_send,
-                         buffer_ptrs, rank, num_ranks, num_experts, num_channels,
-                         is_token_in_rank,
-                         reinterpret_cast<const int4*>(x), x_scales, topk_idx, topk_weights,
-                         num_tokens, num_topk, num_scales, hidden_int4, scale_token_stride, scale_hidden_stride,
-                         num_recv_buffer_tokens);
+    if (num_tokens > 0) {
+        LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens, 256), 256, stream, dispatch_send,
+                             buffer_ptrs, rank, num_ranks, num_experts, num_channels,
+                             is_token_in_rank,
+                             reinterpret_cast<const int4*>(x), x_scales, topk_idx, topk_weights,
+                             num_tokens, num_topk, num_scales, hidden_int4, scale_token_stride, scale_hidden_stride,
+                             num_recv_buffer_tokens,
+                             debug_use_ptr_write ? 1 : 0);
+    }
 
     nvshmemx_barrier_all_on_stream(stream);
 
-    LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_buffer_tokens, 256), 256, stream, dispatch_copy_local,
-                         buffer_ptrs, rank, num_ranks, num_experts, num_channels,
-                         reinterpret_cast<int4*>(recv_x), recv_x_scales,
-                         recv_src_idx, recv_topk_idx, recv_topk_weights,
-                         num_topk, num_scales, hidden_int4, num_recv_buffer_tokens);
+    if (num_recv_buffer_tokens > 0) {
+        LAUNCH_KERNEL_SIMPLE(ceil_div(num_recv_buffer_tokens, 256), 256, stream, dispatch_copy_local,
+                             buffer_ptrs, rank, num_ranks, num_experts, num_channels,
+                             reinterpret_cast<int4*>(recv_x), recv_x_scales,
+                             recv_src_idx, recv_topk_idx, recv_topk_weights,
+                             num_topk, num_scales, hidden_int4, num_recv_buffer_tokens);
+    }
 
-    LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens * num_ranks, 256), 256, stream,
-                         fill_int, send_head, -1, num_tokens * num_ranks);
-    LAUNCH_KERNEL_SIMPLE(ceil_div(num_ranks * num_channels, 256), 256, stream,
-                         fill_int, recv_channel_offset, 0, num_ranks * num_channels);
+    if (num_tokens * num_ranks > 0) {
+        LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens * num_ranks, 256), 256, stream,
+                             fill_int, send_head, -1, num_tokens * num_ranks);
+    }
+    if (num_ranks * num_channels > 0) {
+        LAUNCH_KERNEL_SIMPLE(ceil_div(num_ranks * num_channels, 256), 256, stream,
+                             fill_int, recv_channel_offset, 0, num_ranks * num_channels);
+    }
 #else
     (void)recv_x;
     (void)recv_x_scales;
@@ -649,11 +726,13 @@ void combine(cudaDataType_t type,
                          buffer_ptrs, rank, num_ranks, 0, num_channels,
                          num_recv_buffer_tokens, hidden_int4, num_topk, 0);
 
-    LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens, 256), 256, stream,
-                         combine_send,
-                         buffer_ptrs, rank, num_ranks, 0, num_channels,
-                         reinterpret_cast<const int4*>(x), topk_weights,
-                         src_idx, num_tokens, num_topk, hidden_int4, num_recv_buffer_tokens);
+    if (num_tokens > 0) {
+        LAUNCH_KERNEL_SIMPLE(ceil_div(num_tokens, 256), 256, stream,
+                             combine_send,
+                             buffer_ptrs, rank, num_ranks, 0, num_channels,
+                             reinterpret_cast<const int4*>(x), topk_weights,
+                             src_idx, num_tokens, num_topk, hidden_int4, num_recv_buffer_tokens);
+    }
 
     nvshmemx_barrier_all_on_stream(stream);
 
