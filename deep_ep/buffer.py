@@ -243,18 +243,18 @@ class Buffer:
 
         # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 24, 256, 6, 128),
-            4: Config(Buffer.num_sms, 6, 256, 6, 128),
-            8: Config(Buffer.num_sms, 6, 256, 6, 128),
-            16: Config(Buffer.num_sms, 36, 288, 20, 128),
-            24: Config(Buffer.num_sms, 32, 288, 8, 128),
-            32: Config(Buffer.num_sms, 32, 288, 8, 128),
-            48: Config(Buffer.num_sms, 32, 288, 8, 128),
-            64: Config(Buffer.num_sms, 32, 288, 8, 128),
-            96: Config(Buffer.num_sms, 20, 480, 12, 128),
-            128: Config(Buffer.num_sms, 20, 560, 12, 128),
-            144: Config(Buffer.num_sms, 32, 720, 12, 128),
-            160: Config(Buffer.num_sms, 28, 720, 12, 128),
+            2: Config(Buffer.num_sms, 24, 32768, 6, 32768),
+            4: Config(Buffer.num_sms, 6, 32768, 6, 32768),
+            8: Config(Buffer.num_sms, 6, 32768, 6, 32768),
+            16: Config(Buffer.num_sms, 36, 32768, 20, 32768),
+            24: Config(Buffer.num_sms, 32, 32768, 8, 32768),
+            32: Config(Buffer.num_sms, 32, 32768, 8, 32768),
+            48: Config(Buffer.num_sms, 32, 32768, 8, 32768),
+            64: Config(Buffer.num_sms, 32, 32768, 8, 32768),
+            96: Config(Buffer.num_sms, 20, 32768, 12, 32768),
+            128: Config(Buffer.num_sms, 20, 32768, 12, 32768),
+            144: Config(Buffer.num_sms, 32, 32768, 12, 32768),
+            160: Config(Buffer.num_sms, 28, 32768, 12, 32768),
         }
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
         return config_map[num_ranks]
@@ -273,18 +273,18 @@ class Buffer:
 
         # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 10, 256, 6, 128),
-            4: Config(Buffer.num_sms, 9, 256, 6, 128),
-            8: Config(Buffer.num_sms, 4, 256, 6, 128),
-            16: Config(Buffer.num_sms, 4, 288, 12, 128),
-            24: Config(Buffer.num_sms, 1, 288, 8, 128),
-            32: Config(Buffer.num_sms, 1, 288, 8, 128),
-            48: Config(Buffer.num_sms, 1, 288, 8, 128),
-            64: Config(Buffer.num_sms, 1, 288, 8, 128),
-            96: Config(Buffer.num_sms, 1, 480, 8, 128),
-            128: Config(Buffer.num_sms, 1, 560, 8, 128),
-            144: Config(Buffer.num_sms, 2, 720, 8, 128),
-            160: Config(Buffer.num_sms, 2, 720, 8, 128),
+            2: Config(Buffer.num_sms, 10, 32768, 6, 32768),
+            4: Config(Buffer.num_sms, 9, 32768, 6, 32768),
+            8: Config(Buffer.num_sms, 4, 32768, 6, 32768),
+            16: Config(Buffer.num_sms, 4, 32768, 12, 32768),
+            24: Config(Buffer.num_sms, 1, 32768, 8, 32768),
+            32: Config(Buffer.num_sms, 1, 32768, 8, 32768),
+            48: Config(Buffer.num_sms, 1, 32768, 8, 32768),
+            64: Config(Buffer.num_sms, 1, 32768, 8, 32768),
+            96: Config(Buffer.num_sms, 1, 32768, 8, 32768),
+            128: Config(Buffer.num_sms, 1, 32768, 8, 32768),
+            144: Config(Buffer.num_sms, 2, 32768, 8, 32768),
+            160: Config(Buffer.num_sms, 2, 32768, 8, 32768),
         }
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
         return config_map[num_ranks]

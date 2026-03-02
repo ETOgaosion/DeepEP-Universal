@@ -402,6 +402,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
             rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
         if (use_nvshmem_intranode) {
             intranode_nvshmem_buffer_ptr = internode::alloc(num_nvl_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+            EP_HOST_ASSERT(intranode_nvshmem_buffer_ptr != nullptr);
             for (int i = 0; i < num_nvl_ranks; ++ i)
                 intranode_nvshmem_buffer_ptrs[i] = intranode_nvshmem_buffer_ptr;
             CUDA_CHECK(cudaMalloc(&intranode_nvshmem_buffer_ptrs_gpu, sizeof(void*) * NUM_MAX_NVL_PEERS));
@@ -728,17 +729,19 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     }
 
     // Dispatch
-    EP_HOST_ASSERT(
-        num_ranks * num_ranks * sizeof(int) +                                                                     // Size prefix matrix
-            num_channels * num_ranks * sizeof(int) +                                                              // Channel start offset
-            num_channels * num_ranks * sizeof(int) +                                                              // Channel end offset
-            num_channels * num_ranks * sizeof(int) * 2 +                                                          // Queue head and tail
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * recv_x.element_size() +  // Data buffer
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                     // Source index buffer
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +   // Top-k index buffer
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +        // Top-k weight buffer
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales        // FP8 scale buffer
-        <= num_nvl_bytes);
+    size_t rank_prefix_size = num_ranks * num_ranks * sizeof(int);
+    size_t expert_counts_size = num_experts * sizeof(int);
+    size_t channel_meta_size = num_channels * num_ranks * sizeof(int) * 4;  // start + end + head + tail
+    size_t section_prefix_bytes = rank_prefix_size + expert_counts_size + channel_meta_size;
+    size_t aligned_section_prefix_bytes = (section_prefix_bytes + 15) & ~static_cast<size_t>(15);
+    size_t data_size = num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * recv_x.element_size();
+    size_t total_required = aligned_section_prefix_bytes + data_size +
+                            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
+                            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +
+                            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +
+                            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales;
+
+    EP_HOST_ASSERT(total_required <= num_nvl_bytes);
     intranode::dispatch(recv_x.data_ptr(),
                         recv_x_scales_ptr,
                         recv_src_idx.data_ptr<int>(),
